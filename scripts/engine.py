@@ -220,18 +220,23 @@ def write_srt_file(srt_path: str | Path, text: str, duration_sec: float) -> None
 
 
 def render_subtitles_on_frames(
-    frames: np.ndarray,
+    frames: mx.array,
     text: str,
     position: str = "bottom",
     style: str = "box",
     font_size: int = 24,
-) -> np.ndarray:
-    """Render subtitle text onto each frame using PIL with anti-aliasing."""
+) -> mx.array:
+    """Render subtitle text onto each frame of a [1, 3, F, H, W] MLX tensor."""
     if not text or not text.strip():
         return frames
 
     try:
         from PIL import Image, ImageDraw, ImageFont
+
+        # Convert [1, 3, F, H, W] mlx.array -> [F, H, W, 3] uint8 numpy
+        transposed = mx.transpose(frames[0], (1, 2, 3, 0))
+        uint8_np = np.array(mx.clip(transposed * 255.0 + 0.5, 0.0, 255.0).astype(mx.uint8))
+        F, H, W, _ = uint8_np.shape
 
         # Try to load Apple system font (PingFang TC / Helvetica / STHeiti)
         font = None
@@ -263,12 +268,12 @@ def render_subtitles_on_frames(
         elif style == "stroke":
             box_bg = None
 
-        rendered_frames = []
         clean_text = text.strip()
+        rendered_frames = []
 
         # Process each frame
-        for frame in frames:
-            img = Image.fromarray(frame).convert("RGBA")
+        for i in range(F):
+            img = Image.fromarray(uint8_np[i]).convert("RGBA")
             overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
             draw = ImageDraw.Draw(overlay)
 
@@ -297,12 +302,12 @@ def render_subtitles_on_frames(
             else:  # bottom
                 start_y = img.height - total_text_h - int(img.height * 0.08)
 
-            for i, line_str in enumerate(lines):
+            for j, line_str in enumerate(lines):
                 bbox = draw.textbbox((0, 0), line_str, font=font)
                 lw = bbox[2] - bbox[0]
                 lh = bbox[3] - bbox[1]
                 lx = (img.width - lw) // 2
-                ly = start_y + i * line_height
+                ly = start_y + j * line_height
 
                 if box_bg:
                     pad = int(font_size * 0.35)
@@ -323,7 +328,10 @@ def render_subtitles_on_frames(
             final_img = Image.alpha_composite(img, overlay).convert("RGB")
             rendered_frames.append(np.array(final_img))
 
-        return np.stack(rendered_frames)
+        # Stack back to [F, H, W, 3] -> transpose to [1, 3, F, H, W] float32 in [0.0, 1.0]
+        stacked = np.stack(rendered_frames).astype(np.float32) / 255.0
+        back_mx = mx.array(np.transpose(stacked, (3, 0, 1, 2))[None, ...])
+        return back_mx
     except Exception as e:
         print(f"Subtitle rendering warning (fallback to clean frames): {e}", flush=True)
         return frames
