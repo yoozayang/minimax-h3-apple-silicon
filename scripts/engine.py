@@ -186,7 +186,13 @@ def get_history(limit: int = 20) -> list[dict]:
                 line = line.strip()
                 if line:
                     try:
-                        records.append(json.loads(line))
+                        item = json.loads(line)
+                        # Fix path if file is located in workspace outputs
+                        if item.get("output_filename"):
+                            candidate = OUTPUTS_DIR / item["output_filename"]
+                            if candidate.exists():
+                                item["output_path"] = str(candidate)
+                        records.append(item)
                     except json.JSONDecodeError:
                         continue
         return records[::-1][:limit]
@@ -344,12 +350,26 @@ def generate_video(
 
     Called by both CLI and Web UI.
     """
+    # Ensure target output directory is valid and writable (fallback to project outputs if macOS permission fails)
     target_out_dir = Path(output_dir).expanduser().resolve() if output_dir else OUTPUTS_DIR
-    target_out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        target_out_dir.mkdir(parents=True, exist_ok=True)
+        test_file = target_out_dir / ".minimax_perm_test"
+        test_file.touch()
+        test_file.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"Warning: Custom output dir '{target_out_dir}' not writable ({e}), falling back to project outputs.", file=sys.stderr)
+        target_out_dir = OUTPUTS_DIR
+        target_out_dir.mkdir(parents=True, exist_ok=True)
+
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
     if not prompt or not prompt.strip():
         raise ValueError("Prompt cannot be empty.")
+
+    # Clean previous memory footprint
+    gc.collect()
+    memory.release()
 
     # Resolve seed
     actual_seed = seed if (seed is not None and seed >= 0) else random.randint(1, 2147483647)
@@ -391,6 +411,8 @@ def generate_video(
         first_frame=first_frame,
         last_frame=last_frame,
     )
+
+    peak_memory_bytes = 0
 
     def on_phase_report(item: pipeline.PhaseReport):
         nonlocal peak_memory_bytes
