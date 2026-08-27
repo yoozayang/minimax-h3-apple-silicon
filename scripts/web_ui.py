@@ -906,9 +906,12 @@ INDEX_HTML = """<!DOCTYPE html>
       </button>
 
       <div class="progress-box" id="progress-box">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
           <span class="stage-text" id="stage-text">Preparing...</span>
-          <span class="stage-text" id="time-text">0s</span>
+          <div style="display:flex; gap:0.5rem; align-items:center; font-family:'JetBrains Mono',monospace; font-size:0.8rem;">
+            <span id="stage-pct" style="color:#818cf8; font-weight:700;">0%</span>
+            <span id="time-text" style="color:var(--text-muted);">0s</span>
+          </div>
         </div>
         <div class="progress-bar-bg">
           <div class="progress-bar-fill" id="progress-bar"></div>
@@ -1271,7 +1274,15 @@ INDEX_HTML = """<!DOCTYPE html>
       document.getElementById('stage-text').innerText = job.stage || 'Processing...';
       const pct = Math.min(100, Math.max(5, (job.progress * 100)));
       document.getElementById('progress-bar').style.width = pct + '%';
-      document.getElementById('time-text').innerText = job.elapsed_sec ? Math.floor(job.elapsed_sec) + 's' : '';
+      const pctEl = document.getElementById('stage-pct');
+      if (pctEl) pctEl.innerText = Math.floor(pct) + '%';
+      if (job.elapsed_sec) {
+        const m = Math.floor(job.elapsed_sec / 60);
+        const s = Math.floor(job.elapsed_sec % 60);
+        document.getElementById('time-text').innerText = m > 0 ? `${m}m ${s}s` : `${s}s`;
+      } else {
+        document.getElementById('time-text').innerText = '0s';
+      }
     }
 
     function showIdle() {

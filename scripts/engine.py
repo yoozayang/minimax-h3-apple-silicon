@@ -392,23 +392,43 @@ def generate_video(
         last_frame=last_frame,
     )
 
-    peak_memory_bytes = 0
-
     def on_phase_report(item: pipeline.PhaseReport):
         nonlocal peak_memory_bytes
         if item.peak > peak_memory_bytes:
             peak_memory_bytes = item.peak
-        report_stage(
-            f"Completed phase: {item.label} (active: {item.active_after_run / (1024**3):.1f} GB, peak: {item.peak / (1024**3):.1f} GB)",
-            0.5,
-        )
+
+        if "text" in item.label.lower():
+            report_stage(
+                f"[2/4] 提示詞編碼完成 (Peak {item.peak/(1024**3):.1f} GB)！正在載入 33B DiT 擴散模型...",
+                0.15,
+            )
+        elif "dit" in item.label.lower():
+            report_stage(
+                f"[3/4] 擴散去噪全部完成 (Peak {item.peak/(1024**3):.1f} GB)！正在使用 Video VAE 進行視訊解碼...",
+                0.80,
+            )
+        elif "video" in item.label.lower():
+            report_stage(
+                f"[4/4] 視訊解碼完成！正在進行音訊解碼與字幕封裝...",
+                0.90,
+            )
+        else:
+            report_stage(
+                f"Completed: {item.label} (Peak: {item.peak/(1024**3):.1f} GB)",
+                0.92,
+            )
 
     def on_step_progress(done: int, total: int, sigma_video: float, sigma_audio: float):
-        progress = 0.25 + (done / total) * 0.50
-        report_stage(f"Denoising diffusion step {done}/{total}...", progress)
+        pct = done / total
+        progress = 0.15 + pct * 0.65
+        est_min_left = max(0, round((total - done) * 1.9, 1))
+        report_stage(
+            f"[2/4] 擴散去噪中：第 {done}/{total} 步 ({int(pct * 100)}%) · 預估剩餘約 {est_min_left} 分鐘",
+            progress,
+        )
 
     try:
-        report_stage("Phase 1/4: Encoding text prompt with Qwen3-VL (8-bit)...", 0.08)
+        report_stage("[1/4] 正在使用 Qwen3-VL (8-bit) 進行提示詞文字編碼...", 0.05)
         media_result = pipeline.generate(
             config,
             paths,
