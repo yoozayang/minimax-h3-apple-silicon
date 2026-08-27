@@ -1,0 +1,82 @@
+[project]
+name = "mlx-h3"
+version = "0.0.1a3"
+description = "Pure MLX MiniMax-H3 text-to-video-and-audio inference for Apple Silicon."
+readme = "README.md"
+requires-python = ">=3.13"
+keywords = [
+    "apple-silicon",
+    "audio-generation",
+    "generative-ai",
+    "minimax-h3",
+    "mlx",
+    "text-to-video",
+    "video-generation",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mlx>=0.32",
+]
+
+[project.scripts]
+mlx-h3 = "mlx_h3.cli:main"
+
+[project.urls]
+Homepage = "https://appautomaton.renocrypt.com/mlx-h3/"
+Repository = "https://github.com/appautomaton/mlx-h3"
+Issues = "https://github.com/appautomaton/mlx-h3/issues"
+# Deliberately NOT depended on:
+#   huggingface_hub -- ships telemetry; weights are local, downloads use the
+#                      standalone `hf` CLI installed as a uv tool
+#   safetensors     -- redundant, mx.load() reads safetensors natively (verified)
+#   torch           -- the runtime and validation path are pure MLX
+#   av              -- media I/O uses the external ffmpeg/ffprobe executables
+#   tokenizers      -- local byte-level BPE reads tokenizer.json without HF deps
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-cov>=7.1,<8",
+    "ruff>=0.11,<0.12",
+    "numpy",              # dev/quantize.py only: raw-byte reads during conversion
+]
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-exclude = [".DS_Store"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+xfail_strict = true
+markers = [
+    "checkpoint: reads local checkpoints under weights/ (optional)",
+    "fixture: compares against independently generated local reference data (optional)",
+    "runtime: exercises external tools, Metal extensions, or real inference (optional/slow)",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["mlx_h3"]
+
+[tool.coverage.report]
+fail_under = 85.0
+precision = 1
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py313"
+exclude = [".venv", "weights"]
