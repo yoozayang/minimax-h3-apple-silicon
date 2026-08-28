@@ -389,7 +389,7 @@ def execute_generation_task(
 
 
 def queue_worker_loop():
-    """Continuous background worker that triggers queued items when idle."""
+    """Continuous background worker that triggers queued items (both Video and Image) when idle."""
     while True:
         time.sleep(1.5)
         if not AUTO_QUEUE_ENABLED:
@@ -407,24 +407,45 @@ def queue_worker_loop():
                     save_queue_to_file()
                     break
         if next_item:
-            threading.Thread(
-                target=execute_generation_task,
-                kwargs={
-                    "prompt": next_item["prompt"],
-                    "width": next_item.get("width", 768),
-                    "height": next_item.get("height", 448),
-                    "duration_sec": next_item.get("duration_sec", 2.0),
-                    "steps": next_item.get("steps", 10),
-                    "seed": next_item.get("seed", -1),
-                    "output_dir": next_item.get("output_dir", ""),
-                    "queue_id": next_item["id"],
-                    "profile": next_item.get("profile", "fast"),
-                    "mode": next_item.get("mode", "text"),
-                    "start_image": next_item.get("start_image"),
-                    "references": next_item.get("references"),
-                },
-                daemon=True,
-            ).start()
+            task_type = next_item.get("task_type", "video")
+            if task_type == "image":
+                threading.Thread(
+                    target=execute_image_task,
+                    kwargs={
+                        "prompt": next_item["prompt"],
+                        "width": next_item.get("width", 768),
+                        "height": next_item.get("height", 768),
+                        "steps": next_item.get("steps", 4),
+                        "seed": next_item.get("seed", -1),
+                        "model_name": next_item.get("model_name", "fhdr-uncensored"),
+                        "quality_profile": next_item.get("quality_profile", "high"),
+                        "extreme_quality_mode": next_item.get("extreme_quality_mode", False),
+                        "quantize": next_item.get("quantize", 4),
+                        "count": next_item.get("count", 1),
+                        "output_dir": next_item.get("output_dir", ""),
+                        "queue_id": next_item["id"],
+                    },
+                    daemon=True,
+                ).start()
+            else:
+                threading.Thread(
+                    target=execute_generation_task,
+                    kwargs={
+                        "prompt": next_item["prompt"],
+                        "width": next_item.get("width", 768),
+                        "height": next_item.get("height", 448),
+                        "duration_sec": next_item.get("duration_sec", 2.0),
+                        "steps": next_item.get("steps", 10),
+                        "seed": next_item.get("seed", -1),
+                        "output_dir": next_item.get("output_dir", ""),
+                        "queue_id": next_item["id"],
+                        "profile": next_item.get("profile", "fast"),
+                        "mode": next_item.get("mode", "text"),
+                        "start_image": next_item.get("start_image"),
+                        "references": next_item.get("references"),
+                    },
+                    daemon=True,
+                ).start()
 
 
 threading.Thread(target=queue_worker_loop, daemon=True).start()
@@ -504,6 +525,7 @@ def execute_image_task(
     quantize: int,
     count: int,
     output_dir: str | None,
+    queue_id: str | None = None,
 ):
     cancel_ev = threading.Event()
     with JOB_LOCK:
@@ -516,6 +538,7 @@ def execute_image_task(
         CURRENT_JOB["result"] = None
         CURRENT_JOB["error"] = None
         CURRENT_JOB["cancel_event"] = cancel_ev
+        CURRENT_JOB["active_queue_id"] = queue_id
 
     def on_img_prog(prog: float, msg: str):
         with JOB_LOCK:
@@ -548,6 +571,15 @@ def execute_image_task(
             CURRENT_JOB["result"] = [image_engine.asdict(r) for r in results]
             CURRENT_JOB["cancel_event"] = None
 
+        if queue_id:
+            with QUEUE_LOCK:
+                for item in PROMPT_QUEUE:
+                    if item["id"] == queue_id:
+                        item["status"] = "completed"
+                        item["output_path"] = results[0].output_path if results else None
+                        break
+                save_queue_to_file()
+
     except InterruptedError:
         with JOB_LOCK:
             CURRENT_JOB["is_running"] = False
@@ -555,6 +587,15 @@ def execute_image_task(
             CURRENT_JOB["error"] = "圖片生成已手動取消。"
             CURRENT_JOB["progress"] = 0.0
             CURRENT_JOB["cancel_event"] = None
+
+        if queue_id:
+            with QUEUE_LOCK:
+                for item in PROMPT_QUEUE:
+                    if item["id"] == queue_id:
+                        item["status"] = "cancelled"
+                        item["error_message"] = "🛑 已手動取消"
+                        break
+                save_queue_to_file()
 
     except Exception as e:
         err_msg = str(e)
@@ -566,13 +607,46 @@ def execute_image_task(
             CURRENT_JOB["progress"] = 0.0
             CURRENT_JOB["cancel_event"] = None
 
+        if queue_id:
+            with QUEUE_LOCK:
+                for item in PROMPT_QUEUE:
+                    if item["id"] == queue_id:
+                        item["status"] = "failed"
+                        item["error_message"] = friendly_err
+                        break
+                save_queue_to_file()
+
 
 @app.post("/api/image/generate")
 async def generate_image_endpoint(req: ImageGenerateRequest):
-    """Generate image asynchronously in background thread."""
+    """Generate image. If a job is running, automatically queue into L6 Prompt Queue."""
     with JOB_LOCK:
         if CURRENT_JOB["is_running"]:
-            raise HTTPException(status_code=409, detail="已有生成任務正在執行中，請稍候。")
+            item_id = str(uuid.uuid4())[:8]
+            queue_item = {
+                "id": item_id,
+                "task_type": "image",
+                "prompt": req.prompt.strip(),
+                "model_name": req.model_name,
+                "quality_profile": req.quality_profile,
+                "extreme_quality_mode": req.extreme_quality_mode,
+                "width": req.width,
+                "height": req.height,
+                "steps": req.steps,
+                "seed": req.seed,
+                "quantize": req.quantize,
+                "count": req.count,
+                "output_dir": req.output_dir,
+                "created_at": datetime.now().strftime("%H:%M:%S"),
+                "status": "queued",
+                "output_path": None,
+                "error_message": None,
+            }
+            with QUEUE_LOCK:
+                PROMPT_QUEUE.append(queue_item)
+                save_queue_to_file()
+            return {"status": "queued", "item_id": item_id, "message": "目前已有任務執行中，圖片生成已自動排入排程隊列！"}
+
     thread = threading.Thread(
         target=execute_image_task,
         kwargs={
@@ -1887,7 +1961,18 @@ INDEX_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || '圖片生成啟動失敗');
-        syncJobState();
+
+        if (data.status === 'queued') {
+          showToast('➕ 目前已有任務執行中，已將圖片工作自動排入排程隊列！');
+          if (btnGen) {
+            btnGen.disabled = false;
+            btnGen.innerHTML = '<span>🖼️ 生成圖片</span>';
+          }
+          if (pCard) pCard.style.display = 'none';
+          await fetchQueue();
+        } else {
+          syncJobState();
+        }
       } catch (e) {
         if (pStage) pStage.innerText = `❌ ${e.message}`;
         if (btnGen) {
@@ -2022,23 +2107,29 @@ INDEX_HTML = """<!DOCTYPE html>
           return;
         }
 
-        list.innerHTML = data.items.map(item => `
+        list.innerHTML = data.items.map(item => {
+          const isImg = item.task_type === 'image';
+          const typeBadge = isImg ? '<span style="font-size:0.65rem; background:rgba(236,72,153,0.2); color:#f472b6; padding:0.1rem 0.35rem; border-radius:4px; margin-right:0.3rem;">🖼️ 圖片</span>' : '<span style="font-size:0.65rem; background:rgba(99,102,241,0.2); color:#818cf8; padding:0.1rem 0.35rem; border-radius:4px; margin-right:0.3rem;">🎬 影片</span>';
+          return `
           <div class="queue-card ${item.status}">
             <div class="queue-header">
-              <span class="badge-status ${item.status}">${item.status.toUpperCase()}</span>
+              <div style="display:flex; align-items:center;">
+                ${typeBadge}
+                <span class="badge-status ${item.status}">${item.status.toUpperCase()}</span>
+              </div>
               <div style="display:flex; gap:0.3rem;">
                 ${item.status === 'completed' && item.output_path ? `
-                  <button class="btn-tiny" onclick="event.stopPropagation(); loadHistoryItem({output_path: '${item.output_path}', prompt: '${item.prompt.replace(/'/g, "\\'")}', width:${item.width||768}, height:${item.height||448}, duration_sec:${item.duration_sec||2.0}})">▶️ 播放</button>
+                  <button class="btn-tiny" onclick="event.stopPropagation(); ${isImg ? `setStartImage('${item.output_path.replace(/'/g, "\\'")}')` : `loadHistoryItem({output_path: '${item.output_path}', prompt: '${item.prompt.replace(/'/g, "\\'")}', width:${item.width||768}, height:${item.height||448}, duration_sec:${item.duration_sec||2.0}})`}">▶️ 查看</button>
                   <button class="btn-tiny" onclick="event.stopPropagation(); openOutputFolder('${item.output_path}')">📂 資料夾</button>
                 ` : ''}
                 ${item.status === 'failed' || item.status === 'cancelled' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'retry')">🔄 重試</button>` : ''}
                 <button class="btn-tiny" onclick="queueAction('${item.id}', 'delete')">🗑️</button>
               </div>
             </div>
-            <div style="font-size:0.8rem; color:var(--text-main);">${item.prompt}</div>
-            ${item.error_message ? `<div style="font-size:0.7rem; color:#f87171;">${item.error_message}</div>` : ''}
+            <div style="font-size:0.8rem; color:var(--text-main); margin-top:0.25rem;">${item.prompt}</div>
+            ${item.error_message ? `<div style="font-size:0.7rem; color:#f87171; margin-top:0.2rem;">${item.error_message}</div>` : ''}
           </div>
-        `).join('');
+        `}).join('');
       } catch (e) {}
     }
 
