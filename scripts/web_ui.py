@@ -743,19 +743,29 @@ INDEX_HTML = """<!DOCTYPE html>
     /* Button Actions */
     .btn-row { display: flex; gap: 0.75rem; }
     .btn-generate {
-      flex: 1; background: var(--primary-gradient); border: none; color: white;
+      flex: 1.2; background: var(--primary-gradient); border: none; color: white;
       font-size: 1.05rem; font-weight: 700; padding: 0.95rem; border-radius: 12px;
       cursor: pointer; transition: all 0.25s ease; box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
       display: flex; justify-content: center; align-items: center; gap: 0.5rem;
     }
     .btn-generate:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 24px rgba(99, 102, 241, 0.6); }
     .btn-cancel {
-      flex: 1; background: var(--danger-gradient); border: none; color: white;
+      flex: 1.2; background: var(--danger-gradient); border: none; color: white;
       font-size: 1.05rem; font-weight: 700; padding: 0.95rem; border-radius: 12px;
       cursor: pointer; transition: all 0.2s ease; box-shadow: 0 4px 20px rgba(239, 68, 68, 0.4);
       display: none; justify-content: center; align-items: center; gap: 0.5rem;
     }
     .btn-cancel:hover { box-shadow: 0 6px 24px rgba(239, 68, 68, 0.6); transform: translateY(-2px); }
+
+    .btn-add-queue {
+      flex: 1; background: rgba(99, 102, 241, 0.16); border: 1px solid rgba(99, 102, 241, 0.45);
+      color: #e0e7ff; font-size: 0.95rem; font-weight: 700; padding: 0.95rem 1rem; border-radius: 12px;
+      cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; justify-content: center; gap: 0.4rem;
+    }
+    .btn-add-queue:hover {
+      background: rgba(99, 102, 241, 0.3); border-color: #818cf8; color: white; transform: translateY(-2px);
+      box-shadow: 0 4px 16px rgba(99, 102, 241, 0.25);
+    }
 
     .btn-secondary {
       background: rgba(255, 255, 255, 0.06); border: 1px solid var(--card-border);
@@ -977,11 +987,11 @@ INDEX_HTML = """<!DOCTYPE html>
         <button class="btn-generate" id="btn-gen" onclick="handleGenerateClick()">
           <span>🚀 立即生成 (Generate)</span>
         </button>
-        <button class="btn-secondary" id="btn-add-single-queue" onclick="handleAddToQueueClick()" title="將上方輸入的提示詞（單筆或多筆）加入排程隊列">
-          <span>➕ 批次加入排程</span>
-        </button>
         <button class="btn-cancel" id="btn-cancel" onclick="cancelCurrentGeneration()">
-          <span>🛑 中止生成 (Cancel)</span>
+          <span>🛑 中止當前生成 (Cancel)</span>
+        </button>
+        <button class="btn-add-queue" id="btn-add-queue" onclick="handleAddToQueueClick()" title="將上方輸入的提示詞（單筆或多筆）加入排程隊列">
+          <span>➕ 批次加入排程</span>
         </button>
       </div>
 
@@ -1600,11 +1610,13 @@ INDEX_HTML = """<!DOCTYPE html>
 
     function showRunning(job) {
       document.getElementById('btn-gen').style.display = 'none';
-      document.getElementById('btn-add-single-queue').style.display = 'none';
       const cancelBtn = document.getElementById('btn-cancel');
       cancelBtn.style.display = 'flex';
       cancelBtn.disabled = false;
-      cancelBtn.innerHTML = '<span>🛑 中止生成 (Cancel)</span>';
+      cancelBtn.innerHTML = '<span>🛑 中止當前生成 (Cancel)</span>';
+
+      const addBtn = document.getElementById('btn-add-queue');
+      if (addBtn) addBtn.style.display = 'flex';
 
       document.getElementById('progress-box').style.display = 'flex';
       document.getElementById('stage-text').innerText = job.stage || 'Processing...';
@@ -1623,8 +1635,9 @@ INDEX_HTML = """<!DOCTYPE html>
 
     function showIdle() {
       document.getElementById('btn-gen').style.display = 'flex';
-      document.getElementById('btn-add-single-queue').style.display = 'flex';
       document.getElementById('btn-cancel').style.display = 'none';
+      const addBtn = document.getElementById('btn-add-queue');
+      if (addBtn) addBtn.style.display = 'flex';
       document.getElementById('progress-box').style.display = 'none';
     }
 
