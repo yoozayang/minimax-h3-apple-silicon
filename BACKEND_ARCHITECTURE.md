@@ -95,18 +95,21 @@ IMAGE_MODELS = {
 
 ### 2. 非線性品質設定檔解析器：`resolve_image_profile(...)`
 
-提供 `Draft / Balanced / High / Maximum` 4 級品質設定，針對模型特性自適應最佳參數：
+提供 `Draft / Balanced / High / Maximum` 4 級品質設定，解析度採用 **Resolution Class** 機制（保留使用者設定之長寬比 Aspect Ratio，並對齊至 16 倍數）：
 
 * **FHDR Uncensored (`fhdr-uncensored`)**：
-  * `draft`：10 steps, Guidance 3.5, 4-bit, 512×512 (極速構圖)
-  * `balanced`：20 steps, Guidance 4.0, 4-bit, 768×768 (效率與品質平衡)
-  * `high` (Default)：30 steps, Guidance 4.0, 4-bit, 1024×1024 (高品質正式輸出)
-  * `maximum`：40 steps, Guidance 4.5, 8-bit, 1024×1024 (極致精度 Q8，細膩光影)
+  * **`Draft`**：Q4 / 12 steps / 512-class / Guidance 4.0 (極速構圖)
+  * **`Balanced`**：Q4 / 24 steps / 768-class / Guidance 4.0 (效率與品質平衡)
+  * **`High` (Default)**：Q4 / 40 steps / 1024-class / Guidance 4.0 (高品質正式產出)
+  * **`Maximum`**：Guidance 4.0，參數不預先寫死，由 M1 32GB 實機 Benchmark 評估 3 組候選後採用最佳者：
+    1. `Q8 / 40 steps / 1024-class`
+    2. `Q4 / 40 steps / 更高 Resolution Class (~1280-class)`
+    3. `Q4 / 48 steps / 1024-class`
 * **FLUX.2 Klein 4B (`flux2-klein-4b`)**：
-  * `draft`：2 steps, 4-bit, 512×512
-  * `balanced`：4 steps, 4-bit, 768×768
-  * `high` (Default)：4 steps, 4-bit, 1024×1024
-  * `maximum`：8 steps, 4-bit, 1024×1024
+  * **`Draft`**：Q4 / 2 steps / 512-class
+  * **`Balanced`**：Q4 / 4 steps / 768-class
+  * **`High` (Default)**：Q4 / 4 steps / 1024-class
+  * **`Maximum`**：Q4 / 8 steps / 1024-class
 
 ### 3. 核心生成函式：`generate_images(...)`
 

@@ -200,6 +200,21 @@ def get_available_image_models() -> dict[str, Any]:
     }
 
 
+def _calculate_resolution_by_class(target_class: int, width: int = 768, height: int = 768) -> tuple[int, int]:
+    """Scale requested aspect ratio (width:height) to match target pixel budget (target_class^2), aligned to 16."""
+    w = max(256, width)
+    h = max(256, height)
+    aspect = w / h
+    target_area = float(target_class * target_class)
+
+    new_h = (target_area / aspect) ** 0.5
+    new_w = new_h * aspect
+
+    aligned_w = max(256, min(1536, int(round(new_w / 16.0)) * 16))
+    aligned_h = max(256, min(1536, int(round(new_h / 16.0)) * 16))
+    return aligned_w, aligned_h
+
+
 @dataclass
 class ResolvedImageConfig:
     model_name: str
@@ -220,103 +235,114 @@ def resolve_image_profile(
     custom_steps: int | None = None,
     custom_quantize: int | None = None,
 ) -> ResolvedImageConfig:
-    """Resolve model-specific inference parameters for Draft/Balanced/High/Maximum."""
+    """Resolve model-specific inference parameters for Draft/Balanced/High/Maximum preserving aspect ratio."""
     model_key = "flux2-klein-4b" if "klein" in str(model_name).lower() else "fhdr-uncensored"
     qp = (quality_profile or "high").lower()
 
     if qp == "custom":
-        w = (width // 16) * 16
-        h = (height // 16) * 16
+        w = max(256, min(1536, (width // 16) * 16))
+        h = max(256, min(1536, (height // 16) * 16))
         return ResolvedImageConfig(
             model_name=model_key,
-            steps=custom_steps if custom_steps and custom_steps > 0 else (30 if model_key == "fhdr-uncensored" else 4),
+            steps=custom_steps if custom_steps and custom_steps > 0 else (40 if model_key == "fhdr-uncensored" else 4),
             quantize=custom_quantize if custom_quantize in [4, 8] else 4,
-            width=max(256, min(1536, w)),
-            height=max(256, min(1536, h)),
+            width=w,
+            height=h,
             guidance=4.0 if model_key == "fhdr-uncensored" else 1.0,
             quality_profile="custom",
         )
 
     if model_key == "fhdr-uncensored":
         if qp == "draft":
+            # Draft: Q4 / 12 steps / 512-class / Guidance 4.0
+            w, h = _calculate_resolution_by_class(512, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=10,
+                steps=12,
                 quantize=4,
-                width=512,
-                height=512,
-                guidance=3.5,
+                width=w,
+                height=h,
+                guidance=4.0,
                 quality_profile="draft",
             )
         elif qp == "balanced":
+            # Balanced: Q4 / 24 steps / 768-class / Guidance 4.0
+            w, h = _calculate_resolution_by_class(768, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=20,
+                steps=24,
                 quantize=4,
-                width=768,
-                height=768,
+                width=w,
+                height=h,
                 guidance=4.0,
                 quality_profile="balanced",
             )
         elif qp == "maximum":
-            # Maximum on FHDR: 40 steps, 8-bit precision (8bit branch), Guidance 4.5
+            # Maximum: 1024-class, Guidance 4.0 (to be finalized based on benchmark between Q8/40, Q4/48, Q4/Higher Res)
+            w, h = _calculate_resolution_by_class(1024, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
                 steps=40,
                 quantize=8,
-                width=1024,
-                height=1024,
-                guidance=4.5,
+                width=w,
+                height=h,
+                guidance=4.0,
                 quality_profile="maximum",
             )
         else:  # "high" (Default)
+            # High: Q4 / 40 steps / 1024-class / Guidance 4.0
+            w, h = _calculate_resolution_by_class(1024, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=30,
+                steps=40,
                 quantize=4,
-                width=1024,
-                height=1024,
+                width=w,
+                height=h,
                 guidance=4.0,
                 quality_profile="high",
             )
     else:  # FLUX.2 Klein 4B
         if qp == "draft":
+            w, h = _calculate_resolution_by_class(512, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
                 steps=2,
                 quantize=4,
-                width=512,
-                height=512,
+                width=w,
+                height=h,
                 guidance=1.0,
                 quality_profile="draft",
             )
         elif qp == "balanced":
+            w, h = _calculate_resolution_by_class(768, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
                 steps=4,
                 quantize=4,
-                width=768,
-                height=768,
+                width=w,
+                height=h,
                 guidance=1.0,
                 quality_profile="balanced",
             )
         elif qp == "maximum":
+            w, h = _calculate_resolution_by_class(1024, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
                 steps=8,
                 quantize=4,
-                width=1024,
-                height=1024,
+                width=w,
+                height=h,
                 guidance=1.0,
                 quality_profile="maximum",
             )
         else:  # "high" (Default)
+            w, h = _calculate_resolution_by_class(1024, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
                 steps=4,
                 quantize=4,
-                width=1024,
-                height=1024,
+                width=w,
+                height=h,
                 guidance=1.0,
                 quality_profile="high",
             )
