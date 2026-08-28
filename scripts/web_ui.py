@@ -134,7 +134,7 @@ class ImageGenerateRequest(BaseModel):
     height: int = 768
     steps: int = 4
     seed: int = -1
-    model_name: str = "schnell"
+    model_name: str = "flux2-klein-4b"
     quantize: int = 4
     count: int = 1
 
@@ -1559,7 +1559,7 @@ INDEX_HTML = """<!DOCTYPE html>
             width: 768,
             height: 768,
             steps: 4,
-            model_name: 'schnell',
+            model_name: 'flux2-klein-4b',
             quantize: 4,
             count: 1
           })

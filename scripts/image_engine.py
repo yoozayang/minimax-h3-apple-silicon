@@ -125,13 +125,13 @@ def generate_images(
     height: int = 768,
     steps: int = 4,
     seed: int = -1,
-    model_name: str = "schnell",
+    model_name: str = "flux2-klein-4b",
     quantize: int = 4,
     count: int = 1,
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> list[ImageResult]:
-    """Generate 1 to 4 images sequentially using MFLUX on Apple Silicon."""
+    """Generate 1 to 4 images sequentially using MFLUX (FLUX.2-Klein / FLUX.1) on Apple Silicon."""
     global _RESIDENT_FLUX_MODEL, _RESIDENT_MODEL_NAME
 
     if not prompt or not prompt.strip():
@@ -149,19 +149,30 @@ def generate_images(
     results: list[ImageResult] = []
     count = max(1, min(4, count))
 
+    # Normalize model_name: if user passed "schnell" without HF token, use open ungated FLUX.2-Klein-4B
+    has_hf_token = bool(os.environ.get("HF_TOKEN") or os.path.exists(os.path.expanduser("~/.cache/huggingface/token")))
+    if model_name in ["schnell", "flux2", "flux2-klein", "flux2-klein-4b"] and not has_hf_token:
+        model_name = "flux2-klein-4b"
+
     if progress_callback:
-        progress_callback(0.05, f"正在載入 {model_name.upper()} (MLX {quantize}-bit) 圖像模型...")
+        progress_callback(0.05, f"正在載入 {model_name.upper()} 圖像生成模型...")
 
     # Load model if not resident
     model_key = f"{model_name}_{quantize}bit"
     if _RESIDENT_FLUX_MODEL is None or _RESIDENT_MODEL_NAME != model_key:
         try:
-            from mflux.models.flux.variants.txt2img.flux import Flux1
-            _RESIDENT_FLUX_MODEL = Flux1.from_name(model_name=model_name, quantize=quantize)
+            if "klein" in model_name or "flux2" in model_name:
+                from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
+                from mflux.models.common.config.model_config import ModelConfig
+                cfg = ModelConfig.flux2_klein_4b()
+                _RESIDENT_FLUX_MODEL = Flux2Klein(quantize=quantize, model_config=cfg)
+            else:
+                from mflux.models.flux.variants.txt2img.flux import Flux1
+                _RESIDENT_FLUX_MODEL = Flux1.from_name(model_name=model_name, quantize=quantize)
             _RESIDENT_MODEL_NAME = model_key
         except Exception as e:
             print(f"[ImageEngine] Error loading MFLUX model: {e}", file=sys.stderr)
-            raise RuntimeError(f"無法載入 MFLUX 模型: {e}")
+            raise RuntimeError(f"無法載入 MFLUX 模型 ({model_name}): {e}")
 
     for idx in range(count):
         if cancel_check and cancel_check():
