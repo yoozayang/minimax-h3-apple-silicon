@@ -749,13 +749,7 @@ INDEX_HTML = """<!DOCTYPE html>
       display: flex; justify-content: center; align-items: center; gap: 0.5rem;
     }
     .btn-generate:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 24px rgba(99, 102, 241, 0.6); }
-    .btn-cancel {
-      flex: 1.2; background: var(--danger-gradient); border: none; color: white;
-      font-size: 1.05rem; font-weight: 700; padding: 0.95rem; border-radius: 12px;
-      cursor: pointer; transition: all 0.2s ease; box-shadow: 0 4px 20px rgba(239, 68, 68, 0.4);
-      display: none; justify-content: center; align-items: center; gap: 0.5rem;
-    }
-    .btn-cancel:hover { box-shadow: 0 6px 24px rgba(239, 68, 68, 0.6); transform: translateY(-2px); }
+    .btn-generate:disabled { cursor: not-allowed; transform: none; box-shadow: none; }
 
     .btn-add-queue {
       flex: 1; background: rgba(99, 102, 241, 0.16); border: 1px solid rgba(99, 102, 241, 0.45);
@@ -767,6 +761,14 @@ INDEX_HTML = """<!DOCTYPE html>
       box-shadow: 0 4px 16px rgba(99, 102, 241, 0.25);
     }
 
+    .btn-cancel-mini {
+      background: var(--danger-gradient); border: none; color: white;
+      font-size: 0.75rem; font-weight: 700; padding: 0.35rem 0.65rem; border-radius: 6px;
+      cursor: pointer; transition: all 0.2s ease; box-shadow: 0 2px 8px rgba(239, 68, 68, 0.35);
+      display: flex; align-items: center; gap: 0.3rem; flex-shrink: 0;
+    }
+    .btn-cancel-mini:hover { box-shadow: 0 4px 14px rgba(239, 68, 68, 0.6); transform: translateY(-1px); }
+
     .btn-secondary {
       background: rgba(255, 255, 255, 0.06); border: 1px solid var(--card-border);
       color: var(--text-main); padding: 0.6rem 0.85rem; border-radius: 8px;
@@ -776,8 +778,9 @@ INDEX_HTML = """<!DOCTYPE html>
     .btn-secondary:hover { background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.2); }
 
     .progress-box {
-      background: rgba(11, 15, 23, 0.9); border: 1px solid var(--card-border);
+      background: rgba(11, 15, 23, 0.95); border: 1px solid rgba(99, 102, 241, 0.4);
       border-radius: 12px; padding: 1rem; display: none; flex-direction: column; gap: 0.75rem;
+      box-shadow: 0 4px 20px rgba(99, 102, 241, 0.15);
     }
     .progress-bar-bg { height: 8px; background: rgba(255, 255, 255, 0.1); border-radius: 4px; overflow: hidden; }
     .progress-bar-fill { height: 100%; background: var(--primary-gradient); width: 0%; transition: width 0.3s ease; }
@@ -839,22 +842,38 @@ INDEX_HTML = """<!DOCTYPE html>
     .meta-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
     .meta-val { font-size: 0.95rem; font-weight: 700; color: var(--text-main); font-family: 'JetBrains Mono', monospace; margin-top: 0.2rem; }
 
-    /* History section */
+    /* History section & View modes */
     .history-section { grid-column: 1 / -1; margin-top: 1rem; }
     .history-grid {
       display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 1rem; max-height: 480px; overflow-y: auto; padding-right: 0.5rem;
+      gap: 1rem; max-height: 480px; overflow-y: auto; padding-right: 0.5rem; width: 100%;
+    }
+    .history-list-view {
+      display: flex; flex-direction: column; gap: 0.5rem; max-height: 480px; overflow-y: auto; padding-right: 0.5rem; width: 100%;
     }
     .history-item {
       background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
       border-radius: 10px; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem;
-      cursor: pointer; transition: all 0.2s ease;
+      cursor: pointer; transition: all 0.2s ease; position: relative;
     }
     .history-item:hover { border-color: var(--primary-accent); transform: translateY(-2px); }
+    .history-list-row {
+      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
+      border-radius: 8px; padding: 0.6rem 0.85rem; display: flex; align-items: center; justify-content: space-between;
+      gap: 0.75rem; cursor: pointer; transition: all 0.15s ease;
+    }
+    .history-list-row:hover { border-color: var(--primary-accent); background: rgba(99, 102, 241, 0.08); }
     .history-video-thumb {
       width: 100%; height: 140px; background: #000; border-radius: 6px;
-      overflow: hidden; display: flex; align-items: center; justify-content: center;
+      overflow: hidden; display: flex; align-items: center; justify-content: center; position: relative;
     }
+    .btn-hide-item {
+      position: absolute; top: 6px; right: 6px; background: rgba(0, 0, 0, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.2); color: #e5e7eb; border-radius: 4px;
+      width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
+      font-size: 0.75rem; cursor: pointer; transition: 0.15s ease; z-index: 5;
+    }
+    .btn-hide-item:hover { background: rgba(239, 68, 68, 0.85); border-color: #ef4444; color: white; }
     .history-prompt { font-size: 0.8rem; color: var(--text-main); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.3; }
     .history-footer { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
 
@@ -987,21 +1006,23 @@ INDEX_HTML = """<!DOCTYPE html>
         <button class="btn-generate" id="btn-gen" onclick="handleGenerateClick()">
           <span>🚀 立即生成 (Generate)</span>
         </button>
-        <button class="btn-cancel" id="btn-cancel" onclick="cancelCurrentGeneration()">
-          <span>🛑 中止當前生成 (Cancel)</span>
-        </button>
-        <button class="btn-add-queue" id="btn-add-queue" onclick="handleAddToQueueClick()" title="將上方輸入的提示詞（單筆或多筆）加入排程隊列">
-          <span>➕ 批次加入排程</span>
+        <button class="btn-add-queue" id="btn-add-queue" onclick="handleAddToQueueClick()" title="將上方輸入的提示詞送入排程隊列（可單筆或貼入多行）">
+          <span>➕ 加入排程</span>
         </button>
       </div>
 
-      <!-- Progress Box -->
+      <!-- Progress Box with dedicated Cancel Button -->
       <div class="progress-box" id="progress-box">
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; flex-wrap:wrap;">
           <span class="stage-text" id="stage-text">Preparing...</span>
-          <div style="display:flex; gap:0.5rem; align-items:center; font-family:'JetBrains Mono',monospace; font-size:0.8rem;">
-            <span id="stage-pct" style="color:#818cf8; font-weight:700;">0%</span>
-            <span id="time-text" style="color:var(--text-muted);">0s</span>
+          <div style="display:flex; gap:0.6rem; align-items:center;">
+            <button class="btn-cancel-mini" id="btn-cancel" onclick="cancelCurrentGeneration()" title="立即安全中止當前生成">
+              <span>🛑 中止生成 (Cancel)</span>
+            </button>
+            <div style="display:flex; gap:0.4rem; align-items:center; font-family:'JetBrains Mono',monospace; font-size:0.8rem;">
+              <span id="stage-pct" style="color:#818cf8; font-weight:700;">0%</span>
+              <span id="time-text" style="color:var(--text-muted);">0s</span>
+            </div>
           </div>
         </div>
         <div class="progress-bar-bg">
@@ -1019,7 +1040,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <button class="btn-tiny" onclick="fetchQueue()" title="重新整理排程">🔄 整理</button>
         </div>
         <div class="queue-list" id="queue-items-container">
-          <p style="color:var(--text-muted); font-size:0.8rem; padding:0.5rem 0;">目前排程隊列為空。在上方輸入提示詞後點擊「➕ 批次加入排程」即可新增。</p>
+          <p style="color:var(--text-muted); font-size:0.8rem; padding:0.5rem 0;">目前排程隊列為空。在上方輸入提示詞後點擊「➕ 加入排程」即可新增。</p>
         </div>
       </div>
     </div>
@@ -1148,13 +1169,26 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Bottom: History -->
-    <div class="glass-card history-section">
-      <div class="card-title">
-        <span>🕒 最近生成紀錄 (History)</span>
+    <!-- Bottom: Collapsible History with View Switcher and Hide Support -->
+    <div class="glass-card history-section collapsible open" id="history-drawer">
+      <div class="collapsible-header" style="padding:0.25rem 0; background:transparent; border-bottom:1px solid var(--card-border); padding-bottom:0.75rem;" onclick="toggleDrawer('history-drawer', 'history-arrow')">
+        <div style="display:flex; align-items:center; gap:0.75rem;">
+          <span style="font-size:1.1rem; font-weight:700; color:var(--text-main);">🕒 最近生成紀錄 (History)</span>
+          <span class="badge-status completed" id="history-count-badge">0 部影片</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:0.75rem;" onclick="event.stopPropagation();">
+          <div class="chips-container" style="gap:0.3rem;">
+            <span class="chip active" id="view-grid" onclick="setHistoryView('grid')">🖼️ 網格模式</span>
+            <span class="chip" id="view-list" onclick="setHistoryView('list')">📋 列表模式</span>
+            <button class="btn-tiny" id="btn-unhide" style="display:none;" onclick="resetHiddenHistory()">👁️ 顯示已隱藏 (<span id="hidden-count">0</span>)</button>
+          </div>
+          <span id="history-arrow" style="cursor:pointer; color:var(--text-muted);" onclick="toggleDrawer('history-drawer', 'history-arrow')">▲</span>
+        </div>
       </div>
-      <div class="history-grid" id="history-grid">
-        <p style="color:var(--text-muted); font-size:0.85rem;">目前尚無歷史紀錄。</p>
+      <div class="collapsible-content" style="padding:1rem 0 0 0; border:none; display:flex;">
+        <div id="history-container" class="history-grid">
+          <p style="color:var(--text-muted); font-size:0.85rem;">目前尚無歷史紀錄。</p>
+        </div>
       </div>
     </div>
   </main>
@@ -1166,6 +1200,8 @@ INDEX_HTML = """<!DOCTYPE html>
     let lastToastError = null;
     let playMode = 'single';
     let serverPaths = { default: '', desktop: '', downloads: '', movies: '' };
+    let historyViewMode = localStorage.getItem('minimax_history_view') || 'grid';
+    let hiddenHistoryKeys = JSON.parse(localStorage.getItem('minimax_hidden_history') || '[]');
 
     function showToast(msg, duration=3500) {
       const toast = document.getElementById('toast');
@@ -1324,7 +1360,7 @@ INDEX_HTML = """<!DOCTYPE html>
       badge.innerText = `${queuedCount} 筆待處理`;
 
       if (!items || items.length === 0) {
-        container.innerHTML = '<p style="color:var(--text-muted); font-size:0.8rem; padding:0.5rem 0;">目前排程隊列為空。在上方輸入提示詞後點擊「➕ 批次加入排程」即可新增。</p>';
+        container.innerHTML = '<p style="color:var(--text-muted); font-size:0.8rem; padding:0.5rem 0;">目前排程隊列為空。在上方輸入提示詞後點擊「➕ 加入排程」即可新增。</p>';
         return;
       }
 
@@ -1476,8 +1512,10 @@ INDEX_HTML = """<!DOCTYPE html>
     async function cancelCurrentGeneration() {
       try {
         const btn = document.getElementById('btn-cancel');
-        btn.innerText = '中止中... (Cancelling)';
-        btn.disabled = true;
+        if (btn) {
+          btn.innerText = '中止中...';
+          btn.disabled = true;
+        }
         await fetch('/api/generate/cancel', { method: 'POST' });
         showToast("已發送中止訊號，正在釋放 Metal 記憶體...");
       } catch(e) {}
@@ -1539,31 +1577,117 @@ INDEX_HTML = """<!DOCTYPE html>
       } catch (e) {}
     }
 
+    /* History Management: Grid/List View & Hide Individual Items */
+    function setHistoryView(mode) {
+      historyViewMode = mode;
+      localStorage.setItem('minimax_history_view', mode);
+      document.getElementById('view-grid').classList.toggle('active', mode === 'grid');
+      document.getElementById('view-list').classList.toggle('active', mode === 'list');
+      fetchHistory();
+    }
+
+    function hideHistoryItem(key, event) {
+      if (event) event.stopPropagation();
+      if (!hiddenHistoryKeys.includes(key)) {
+        hiddenHistoryKeys.push(key);
+        localStorage.setItem('minimax_hidden_history', JSON.stringify(hiddenHistoryKeys));
+      }
+      showToast("已隱藏該部影片紀錄", 1500);
+      fetchHistory();
+    }
+
+    function resetHiddenHistory() {
+      hiddenHistoryKeys = [];
+      localStorage.setItem('minimax_hidden_history', JSON.stringify([]));
+      showToast("已重置並顯示所有隱藏影片", 1500);
+      fetchHistory();
+    }
+
     async function fetchHistory() {
       try {
         const res = await fetch('/api/history');
         if (!res.ok) return [];
         const items = await res.json();
-        const grid = document.getElementById('history-grid');
+        const container = document.getElementById('history-container');
+        const badge = document.getElementById('history-count-badge');
+        const unhideBtn = document.getElementById('btn-unhide');
+        const hiddenCountEl = document.getElementById('hidden-count');
+
+        if (unhideBtn && hiddenCountEl) {
+          const hiddenCount = hiddenHistoryKeys.length;
+          hiddenCountEl.innerText = hiddenCount;
+          unhideBtn.style.display = hiddenCount > 0 ? 'inline-block' : 'none';
+        }
+
         if (!items || items.length === 0) {
-          grid.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">目前尚無歷史紀錄。</p>';
+          badge.innerText = '0 部影片';
+          container.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">目前尚無歷史紀錄。</p>';
           return [];
         }
-        grid.innerHTML = items.map(item => {
-          const videoSrc = item.output_path ? `/api/video-stream?path=${encodeURIComponent(item.output_path)}` : (item.output_filename ? `/outputs/${item.output_filename}` : '');
-          return `
-          <div class="history-item" onclick='loadHistoryItem(${JSON.stringify(item)})'>
-            <div class="history-video-thumb">
-              ${videoSrc ? `<video src="${videoSrc}" preload="metadata" muted></video>` : '❌ Failed'}
-            </div>
-            <div class="history-prompt">${item.prompt}</div>
-            <div class="history-footer">
-              <span>${item.width}x${item.height} (${item.duration_sec}s)</span>
-              <span>${item.execution_time_sec ? (item.execution_time_sec/60).toFixed(1)+'m' : ''}</span>
-            </div>
-          </div>
-        `}).join('');
-        return items;
+
+        const visibleItems = items.filter(item => {
+          const key = item.output_filename || item.output_path;
+          return !hiddenHistoryKeys.includes(key);
+        });
+
+        badge.innerText = `${visibleItems.length} 部影片`;
+
+        if (visibleItems.length === 0) {
+          container.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">所有歷史影片均已隱藏，點擊右上角可還原顯示。</p>';
+          return visibleItems;
+        }
+
+        if (historyViewMode === 'list') {
+          container.className = 'history-list-view';
+          container.innerHTML = visibleItems.map(item => {
+            const key = item.output_filename || item.output_path;
+            const videoSrc = item.output_path ? `/api/video-stream?path=${encodeURIComponent(item.output_path)}` : (item.output_filename ? `/outputs/${item.output_filename}` : '');
+            return `
+              <div class="history-list-row" onclick='loadHistoryItem(${JSON.stringify(item)})'>
+                <div style="display:flex; align-items:center; gap:0.75rem; min-width:0; flex:1;">
+                  <span style="font-size:1.2rem; color:#818cf8;">🎬</span>
+                  <div style="min-width:0; flex:1;">
+                    <div style="font-size:0.85rem; font-weight:600; color:var(--text-main); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                      ${item.prompt}
+                    </div>
+                    <div style="font-size:0.7rem; color:var(--text-muted); font-family:'JetBrains Mono',monospace; display:flex; gap:0.5rem; margin-top:0.2rem;">
+                      <span>${item.output_filename || ''}</span>
+                      <span>•</span>
+                      <span>${item.width}x${item.height}</span>
+                      <span>•</span>
+                      <span>${item.duration_sec}s</span>
+                      ${item.execution_time_sec ? `<span>• ${(item.execution_time_sec/60).toFixed(1)}m</span>` : ''}
+                    </div>
+                  </div>
+                </div>
+                <div style="display:flex; gap:0.4rem; align-items:center;" onclick="event.stopPropagation();">
+                  <button class="btn-tiny" onclick='loadHistoryItem(${JSON.stringify(item)})' title="在播放器播放">▶️ 播放</button>
+                  <button class="btn-tiny" onclick="hideHistoryItem('${key}', event)" title="從列表中隱藏">✕ 隱藏</button>
+                </div>
+              </div>
+            `;
+          }).join('');
+        } else {
+          container.className = 'history-grid';
+          container.innerHTML = visibleItems.map(item => {
+            const key = item.output_filename || item.output_path;
+            const videoSrc = item.output_path ? `/api/video-stream?path=${encodeURIComponent(item.output_path)}` : (item.output_filename ? `/outputs/${item.output_filename}` : '');
+            return `
+              <div class="history-item" onclick='loadHistoryItem(${JSON.stringify(item)})'>
+                <button class="btn-hide-item" onclick="hideHistoryItem('${key}', event)" title="隱藏這部影片">✕</button>
+                <div class="history-video-thumb">
+                  ${videoSrc ? `<video src="${videoSrc}" preload="metadata" muted></video>` : '❌ Failed'}
+                </div>
+                <div class="history-prompt">${item.prompt}</div>
+                <div class="history-footer">
+                  <span>${item.width}x${item.height} (${item.duration_sec}s)</span>
+                  <span>${item.execution_time_sec ? (item.execution_time_sec/60).toFixed(1)+'m' : ''}</span>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+        return visibleItems;
       } catch (e) { return []; }
     }
 
@@ -1609,14 +1733,22 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     function showRunning(job) {
-      document.getElementById('btn-gen').style.display = 'none';
-      const cancelBtn = document.getElementById('btn-cancel');
-      cancelBtn.style.display = 'flex';
-      cancelBtn.disabled = false;
-      cancelBtn.innerHTML = '<span>🛑 中止當前生成 (Cancel)</span>';
+      const genBtn = document.getElementById('btn-gen');
+      genBtn.disabled = true;
+      genBtn.style.opacity = '0.65';
+      genBtn.innerHTML = '<span>⏳ 任務生成中...</span>';
 
       const addBtn = document.getElementById('btn-add-queue');
-      if (addBtn) addBtn.style.display = 'flex';
+      if (addBtn) {
+        addBtn.disabled = false;
+        addBtn.style.display = 'flex';
+      }
+
+      const cancelBtn = document.getElementById('btn-cancel');
+      if (cancelBtn) {
+        cancelBtn.disabled = false;
+        cancelBtn.innerHTML = '<span>🛑 中止生成 (Cancel)</span>';
+      }
 
       document.getElementById('progress-box').style.display = 'flex';
       document.getElementById('stage-text').innerText = job.stage || 'Processing...';
@@ -1634,10 +1766,17 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     function showIdle() {
-      document.getElementById('btn-gen').style.display = 'flex';
-      document.getElementById('btn-cancel').style.display = 'none';
+      const genBtn = document.getElementById('btn-gen');
+      genBtn.disabled = false;
+      genBtn.style.opacity = '1.0';
+      genBtn.innerHTML = '<span>🚀 立即生成 (Generate)</span>';
+
       const addBtn = document.getElementById('btn-add-queue');
-      if (addBtn) addBtn.style.display = 'flex';
+      if (addBtn) {
+        addBtn.disabled = false;
+        addBtn.style.display = 'flex';
+      }
+
       document.getElementById('progress-box').style.display = 'none';
     }
 
@@ -1715,6 +1854,7 @@ INDEX_HTML = """<!DOCTYPE html>
     // Initialize on page load
     async function initApp() {
       updateDurationDisplay(2.0);
+      setHistoryView(historyViewMode);
       await fetchStatus();
       await fetchQueue();
       await syncJobState();
