@@ -1288,7 +1288,7 @@ INDEX_HTML = """<!DOCTYPE html>
               <span>創意提示詞 (Prompt)</span>
               <span style="font-size:0.7rem; color:var(--text-muted);">多行自動支援批次排程</span>
             </label>
-            <textarea id="prompt" placeholder="輸入描述 (例如: A cinematic shot of a happy golden retriever running in a park, soft sunlight filtering through trees)"></textarea>
+            <textarea id="prompt" placeholder="輸入描述 (例如: A cinematic shot of a happy golden retriever running in a park, soft sunlight filtering through trees)" oninput="localStorage.setItem('minimax_draft_prompt', this.value);"></textarea>
           </div>
 
           <!-- Image Generation Controls (Model & Quality Bar) -->
@@ -2292,6 +2292,11 @@ INDEX_HTML = """<!DOCTYPE html>
 
     // Init
     async function initApp() {
+      const draftPrompt = localStorage.getItem('minimax_draft_prompt');
+      const promptEl = document.getElementById('prompt');
+      if (draftPrompt && promptEl && !promptEl.value.trim()) {
+        promptEl.value = draftPrompt;
+      }
       await loadAvailableImageModels();
       await syncStatus();
       await syncJobState();
