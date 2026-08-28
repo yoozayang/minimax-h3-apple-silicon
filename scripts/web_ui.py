@@ -1547,6 +1547,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     // Start Image Handler
     function setStartImage(filePath, localBlobUrl) {
+      if (!filePath && !localBlobUrl) return;
       currentStartImagePath = filePath;
       switchVideoMode('image');
       const thumb = document.getElementById('start-image-thumb');
@@ -1557,7 +1558,7 @@ INDEX_HTML = """<!DOCTYPE html>
       placeholder.style.display = 'none';
       clearBtn.style.display = 'block';
       if (filePath) {
-        showToast('🎬 已設定為影片起始幀 (I2V)！');
+        showToast('🎬 已成功設定為影片起始幀 (I2V)！');
       }
     }
 
@@ -1589,6 +1590,61 @@ INDEX_HTML = """<!DOCTYPE html>
         showToast(`❌ 上傳失敗: ${e.message}`);
         clearStartImage();
       }
+    }
+
+    // Reference Subjects Handler
+    function renderRefSubjectsList() {
+      const listEl = document.getElementById('ref-images-list');
+      if (!listEl) return;
+      if (currentRefSubjects.length === 0) {
+        listEl.innerHTML = '<span style="font-size:0.75rem; color:var(--text-muted);">尚無特徵參考圖，可點擊「➕ 加圖」或從下方圖片庫點「🏷️ 設參考」。</span>';
+        return;
+      }
+      listEl.innerHTML = currentRefSubjects.map((ref, idx) => `
+        <div style="display:flex; align-items:center; gap:0.4rem; background:rgba(255,255,255,0.06); border:1px solid var(--card-border); padding:0.25rem 0.5rem; border-radius:6px;">
+          <img src="/api/video-stream?path=${encodeURIComponent(ref.image || ref.path || '')}" style="width:24px; height:24px; object-fit:cover; border-radius:4px;" />
+          <span style="font-size:0.75rem; color:var(--text-main);">${ref.name || 'Subject ' + (idx+1)}</span>
+          <button class="btn-tiny" onclick="removeRefSubject(${idx})" style="padding:0.1rem 0.3rem;">✕</button>
+        </div>
+      `).join('');
+    }
+
+    function addRefSubjectImageDirect(filePath, name) {
+      if (!filePath) return;
+      currentRefSubjects.push({ image: filePath, name: name || 'Subject' });
+      switchVideoMode('reference');
+      renderRefSubjectsList();
+      showToast('🏷️ 已將圖片加入特徵參考庫 (Ref2V)！');
+    }
+
+    function removeRefSubject(idx) {
+      currentRefSubjects.splice(idx, 1);
+      renderRefSubjectsList();
+    }
+
+    function addRefSubjectImage() {
+      const nameInput = document.getElementById('ref-subject-name');
+      const name = (nameInput?.value || '').trim() || 'Subject';
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        showToast('⏳ 正在上傳參考圖...');
+        const formData = new FormData();
+        formData.append('file', file);
+        try {
+          const res = await fetch('/api/assets/upload', { method: 'POST', body: formData });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || '上傳失敗');
+          addRefSubjectImageDirect(data.path, name);
+          if (nameInput) nameInput.value = '';
+        } catch (err) {
+          showToast(`❌ ${err.message}`);
+        }
+      };
+      input.click();
     }
 
     // Image Generation API
@@ -1630,18 +1686,25 @@ INDEX_HTML = """<!DOCTYPE html>
         const items = await res.json();
         const grid = document.getElementById('images-grid');
         if (!items || items.length === 0) {
-          grid.innerHTML = '<span style="font-size:0.75rem; color:var(--text-muted);">尚無生成圖片。</span>';
+          grid.innerHTML = '<span style="font-size:0.75rem; color:var(--text-muted);">尚無生成圖片。點擊上方「🖼️ 生成圖片」即可快速構圖！</span>';
           return;
         }
-        grid.innerHTML = items.map(img => `
+        grid.innerHTML = items.map(img => {
+          const filePath = img.output_path || img.path || '';
+          const safePath = filePath.replace(/'/g, "\\'");
+          return `
           <div class="img-card">
-            <img src="/api/video-stream?path=${encodeURIComponent(img.path)}" alt="${img.prompt}" />
+            <img src="/api/video-stream?path=${encodeURIComponent(filePath)}" alt="${img.prompt || ''}" onclick="setStartImage('${safePath}');" title="點擊直接設為影片起始幀 (I2V)" />
             <div class="img-card-actions">
-              <button class="btn-tiny" onclick="setStartImage('${img.path}');">🎬 設起始幀</button>
-              <button class="btn-tiny" onclick="openOutputFolder('${img.path}')">📂 Finder</button>
+              <div style="font-size:0.68rem; color:var(--text-main); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:0.1rem 0.2rem;" title="${img.prompt || ''}">${img.prompt || '無描述'}</div>
+              <div style="display:flex; gap:0.25rem;">
+                <button class="btn-card-mini" style="flex:1; background:rgba(99,102,241,0.3); color:#a5b4fc; font-weight:700;" onclick="setStartImage('${safePath}');" title="設為影片起始幀 (I2V)">🎬 設起始幀</button>
+                <button class="btn-card-mini" onclick="addRefSubjectImageDirect('${safePath}', '${(img.prompt||'Subject').slice(0,10).replace(/'/g, "\\'")}')" title="加入特徵參考庫 (Ref2V)">🏷️ 參考</button>
+                <button class="btn-card-mini" onclick="openOutputFolder('${safePath}')" title="在 Finder 中定位檔案">📂</button>
+              </div>
             </div>
           </div>
-        `).join('');
+        `}).join('');
       } catch (e) {}
     }
 
