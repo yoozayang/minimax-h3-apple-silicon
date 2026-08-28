@@ -492,23 +492,29 @@ async def set_hf_token_endpoint(req: HFTokenRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/image/generate")
-async def generate_image_endpoint(req: ImageGenerateRequest):
-    """Generate image locally using MFLUX with dynamic memory swap."""
-    with JOB_LOCK:
-        if CURRENT_JOB["is_running"]:
-            raise HTTPException(status_code=409, detail="已有生成任務正在執行中，請稍候。")
-        CURRENT_JOB["is_running"] = True
-        CURRENT_JOB["job_type"] = "IMAGE"
-        CURRENT_JOB["stage"] = "正在載入圖片引擎並生成..."
-        CURRENT_JOB["progress"] = 0.05
-        CURRENT_JOB["started_at"] = time.time()
-        CURRENT_JOB["prompt"] = req.prompt.strip()
-        CURRENT_JOB["result"] = None
-        CURRENT_JOB["error"] = None
-
+def execute_image_task(
+    prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    seed: int,
+    model_name: str,
+    quality_profile: str,
+    extreme_quality_mode: bool,
+    quantize: int,
+    count: int,
+    output_dir: str | None,
+):
     cancel_ev = threading.Event()
     with JOB_LOCK:
+        CURRENT_JOB["is_running"] = True
+        CURRENT_JOB["job_type"] = "IMAGE"
+        CURRENT_JOB["stage"] = f"正在載入 {model_name.upper()} 圖片引擎..."
+        CURRENT_JOB["progress"] = 0.05
+        CURRENT_JOB["started_at"] = time.time()
+        CURRENT_JOB["prompt"] = prompt.strip()
+        CURRENT_JOB["result"] = None
+        CURRENT_JOB["error"] = None
         CURRENT_JOB["cancel_event"] = cancel_ev
 
     def on_img_prog(prog: float, msg: str):
@@ -518,37 +524,74 @@ async def generate_image_endpoint(req: ImageGenerateRequest):
 
     try:
         results = image_engine.generate_images(
-            prompt=req.prompt,
-            width=req.width,
-            height=req.height,
-            steps=req.steps,
-            seed=req.seed,
-            model_name=req.model_name,
-            quality_profile=req.quality_profile,
-            extreme_quality_mode=req.extreme_quality_mode,
-            quantize=req.quantize,
-            count=req.count,
-            output_dir=req.output_dir,
+            prompt=prompt,
+            width=width,
+            height=height,
+            steps=steps,
+            seed=seed,
+            model_name=model_name,
+            quality_profile=quality_profile,
+            extreme_quality_mode=extreme_quality_mode,
+            quantize=quantize,
+            count=count,
+            output_dir=output_dir,
             progress_callback=on_img_prog,
             cancel_check=lambda: cancel_ev.is_set(),
         )
+        if cancel_ev.is_set():
+            raise InterruptedError("Image generation was cancelled by user.")
+
         with JOB_LOCK:
             CURRENT_JOB["is_running"] = False
             CURRENT_JOB["progress"] = 1.0
             CURRENT_JOB["stage"] = "圖片生成完成！"
             CURRENT_JOB["result"] = [image_engine.asdict(r) for r in results]
             CURRENT_JOB["cancel_event"] = None
-        return {"status": "ok", "results": [image_engine.asdict(r) for r in results]}
+
+    except InterruptedError:
+        with JOB_LOCK:
+            CURRENT_JOB["is_running"] = False
+            CURRENT_JOB["stage"] = "🛑 圖片生成已取消"
+            CURRENT_JOB["error"] = "圖片生成已手動取消。"
+            CURRENT_JOB["progress"] = 0.0
+            CURRENT_JOB["cancel_event"] = None
 
     except Exception as e:
         err_msg = str(e)
+        friendly_err = summarize_error(err_msg)
         with JOB_LOCK:
             CURRENT_JOB["is_running"] = False
             CURRENT_JOB["stage"] = "圖片生成失敗"
-            CURRENT_JOB["error"] = err_msg
+            CURRENT_JOB["error"] = friendly_err
             CURRENT_JOB["progress"] = 0.0
             CURRENT_JOB["cancel_event"] = None
-        raise HTTPException(status_code=500, detail=f"圖片生成失敗: {err_msg}")
+
+
+@app.post("/api/image/generate")
+async def generate_image_endpoint(req: ImageGenerateRequest):
+    """Generate image asynchronously in background thread."""
+    with JOB_LOCK:
+        if CURRENT_JOB["is_running"]:
+            raise HTTPException(status_code=409, detail="已有生成任務正在執行中，請稍候。")
+    thread = threading.Thread(
+        target=execute_image_task,
+        kwargs={
+            "prompt": req.prompt,
+            "width": req.width,
+            "height": req.height,
+            "steps": req.steps,
+            "seed": req.seed,
+            "model_name": req.model_name,
+            "quality_profile": req.quality_profile,
+            "extreme_quality_mode": req.extreme_quality_mode,
+            "quantize": req.quantize,
+            "count": req.count,
+            "output_dir": req.output_dir,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return {"status": "started"}
 
 
 @app.on_event("startup")
@@ -1806,33 +1849,24 @@ INDEX_HTML = """<!DOCTYPE html>
       const output_dir = (document.getElementById('output-dir')?.value || '').trim();
       const modeText = extremeQualityMode ? `${currentImageQuality.toUpperCase()} · 🔥極限` : currentImageQuality.toUpperCase();
 
+      // Update button state immediately
+      const btnGen = document.querySelector('.btn-gen-img');
+      if (btnGen) {
+        btnGen.disabled = true;
+        btnGen.innerHTML = '<span>⏳ 正在啟動...</span>';
+      }
+
       // Show L3 progress card immediately
       const pCard = document.getElementById('progress-card');
       const pStage = document.getElementById('progress-stage-text');
       const pFill = document.getElementById('progress-fill');
       const pPct = document.getElementById('progress-pct-text');
-      if (pCard) pCard.style.display = 'block';
-      if (pStage) pStage.innerText = `🎨 [ImageEngine] 正在準備 ${model_name.toUpperCase()} (${modeText})...`;
-      if (pFill) pFill.style.width = '10%';
-      if (pPct) pPct.innerText = '10%';
+      if (pCard) pCard.style.display = 'flex';
+      if (pStage) pStage.innerText = `🎨 [ImageEngine] 正在啟動 ${model_name.toUpperCase()} (${modeText})...`;
+      if (pFill) pFill.style.width = '8%';
+      if (pPct) pPct.innerText = '8%';
 
       showToast(`🎨 開始使用 ${model_name.toUpperCase()} (${modeText}) 生成圖片...`);
-
-      // Start periodic progress polling
-      const pollTimer = setInterval(async () => {
-        try {
-          const sRes = await fetch('/api/job');
-          if (sRes.ok) {
-            const job = await sRes.json();
-            if (job.is_running && job.job_type === 'IMAGE') {
-              if (pStage && job.stage) pStage.innerText = job.stage;
-              const pct = Math.round((job.progress || 0.1) * 100);
-              if (pFill) pFill.style.width = `${pct}%`;
-              if (pPct) pPct.innerText = `${pct}%`;
-            }
-          }
-        } catch(e) {}
-      }, 500);
 
       try {
         const res = await fetch('/api/image/generate', {
@@ -1851,18 +1885,15 @@ INDEX_HTML = """<!DOCTYPE html>
             output_dir: output_dir
           })
         });
-        clearInterval(pollTimer);
         const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || '圖片生成失敗');
-        if (pStage) pStage.innerText = '✅ 圖片生成完成！';
-        if (pFill) pFill.style.width = '100%';
-        if (pPct) pPct.innerText = '100%';
-        showToast('✅ 圖片生成成功！已加入下方圖片庫。');
-        await fetchImageHistory();
-        setTimeout(() => { if (pCard) pCard.style.display = 'none'; }, 2500);
+        if (!res.ok) throw new Error(data.detail || '圖片生成啟動失敗');
+        syncJobState();
       } catch (e) {
-        clearInterval(pollTimer);
         if (pStage) pStage.innerText = `❌ ${e.message}`;
+        if (btnGen) {
+          btnGen.disabled = false;
+          btnGen.innerHTML = '<span>🖼️ 生成圖片</span>';
+        }
         showToast(`❌ ${e.message}`);
       }
     }
@@ -2023,11 +2054,6 @@ INDEX_HTML = """<!DOCTYPE html>
     async function toggleAutoQueue() {
       await fetch('/api/queue/toggle-auto', {method: 'POST'});
       fetchQueue();
-    }
-
-    async function cancelCurrentTask() {
-      await fetch('/api/generate/cancel', {method: 'POST'});
-      showToast('🛑 正在中斷任務...');
     }
 
     // Player & Subtitles
@@ -2220,7 +2246,20 @@ INDEX_HTML = """<!DOCTYPE html>
       });
     }
 
+    let lastJobRunning = false;
+    let lastHandledJobType = null;
     let lastHandledResultPath = null;
+
+    // Cancel Job
+    async function cancelCurrentTask() {
+      const pStage = document.getElementById('progress-stage-text');
+      if (pStage) pStage.innerText = '🛑 正在中斷生成並釋放顯存...';
+      showToast('🛑 正在中斷任務...');
+      try {
+        await fetch('/api/generate/cancel', {method: 'POST'});
+      } catch (e) {}
+      await syncJobState();
+    }
 
     // Reactive State Sync Loop
     async function syncJobState() {
@@ -2233,8 +2272,22 @@ INDEX_HTML = """<!DOCTYPE html>
         const pPct = document.getElementById('progress-pct-text');
         const pTime = document.getElementById('progress-time-text');
         const stateText = document.getElementById('system-state-text');
+        const btnGenImg = document.querySelector('.btn-gen-img');
+        const btnGenVid = document.querySelector('.btn-gen-vid');
 
         if (data.is_running) {
+          lastJobRunning = true;
+          lastHandledJobType = data.job_type || 'VIDEO';
+
+          if (btnGenImg) {
+            btnGenImg.disabled = true;
+            btnGenImg.innerHTML = '<span>⏳ 圖片生成中...</span>';
+          }
+          if (btnGenVid) {
+            btnGenVid.disabled = true;
+            btnGenVid.innerHTML = '<span>⏳ 影片生成中...</span>';
+          }
+
           pCard.style.display = 'flex';
           pFill.style.width = `${Math.max(5, Math.round(data.progress * 100))}%`;
           pStage.innerText = data.stage || '生成中...';
@@ -2245,8 +2298,39 @@ INDEX_HTML = """<!DOCTYPE html>
           }
           stateText.innerText = (data.job_type === 'IMAGE' ? '🎨 圖片生成中' : '🎬 影片去噪中');
         } else {
-          pCard.style.display = 'none';
+          // Job just transitioned from running to stopped
+          if (lastJobRunning) {
+            lastJobRunning = false;
+            if (btnGenImg) {
+              btnGenImg.disabled = false;
+              btnGenImg.innerHTML = '<span>🖼️ 生成圖片</span>';
+            }
+            if (btnGenVid) {
+              btnGenVid.disabled = false;
+              btnGenVid.innerHTML = '<span>🚀 生成影片</span>';
+            }
+
+            if (data.error) {
+              if (data.error.includes('取消') || data.error.includes('cancelled') || data.error.includes('Interrupted')) {
+                showToast('🛑 任務已成功中止並釋放顯存！');
+              } else {
+                showToast(`❌ 生成失敗: ${data.error}`);
+              }
+            } else if (lastHandledJobType === 'IMAGE') {
+              showToast('✅ 圖片生成成功！已加入下方圖片庫。');
+              await fetchImageHistory();
+            } else if (lastHandledJobType === 'VIDEO') {
+              showToast('✅ 影片生成完成！');
+              await fetchHistory();
+              await fetchQueue();
+            }
+            setTimeout(() => { if (!lastJobRunning && pCard) pCard.style.display = 'none'; }, 2000);
+          } else {
+            pCard.style.display = 'none';
+          }
+
           stateText.innerText = 'Ready';
+
           if (data.result && data.result.output_path && data.result.output_path !== lastHandledResultPath) {
             lastHandledResultPath = data.result.output_path;
             displayResult(data.result);
