@@ -23,6 +23,11 @@ REPO_SRC = BASE_DIR / "repo" / "src"
 if str(REPO_SRC) not in sys.path:
     sys.path.insert(0, str(REPO_SRC))
 
+try:
+    from scripts import model_manager
+except ImportError:
+    import model_manager
+
 import numpy as np
 import mlx.core as mx
 from mlx_h3 import layout, memory, output, pipeline, sampler
@@ -31,6 +36,60 @@ MODELS_DIR = BASE_DIR / "models"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 LOGS_DIR = BASE_DIR / "logs"
 HISTORY_FILE = LOGS_DIR / "history.jsonl"
+
+
+def extract_last_frame_from_video(video_path: str | Path, output_image_path: str | Path) -> str:
+    """Extract the last video frame as a high-quality PNG image for continuation."""
+    v_path = Path(video_path).expanduser().resolve()
+    out_img = Path(output_image_path).expanduser().resolve()
+    out_img.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-sseof", "-0.1",
+        "-i", str(v_path),
+        "-frames:v", "1",
+        "-update", "1",
+        "-q:v", "1",
+        str(out_img),
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return str(out_img)
+
+
+def stitch_video_segments(
+    segment_paths: list[str | Path],
+    output_path: str | Path,
+    crossfade_sec: float = 0.2,
+) -> str:
+    """Stitch multiple video segments with smooth transition into a final MP4."""
+    out_p = Path(output_path).expanduser().resolve()
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    valid_segments = [Path(p).expanduser().resolve() for p in segment_paths if Path(p).exists()]
+    if not valid_segments:
+        raise FileNotFoundError("No valid video segments found to stitch.")
+    if len(valid_segments) == 1:
+        shutil.copy(str(valid_segments[0]), str(out_p))
+        return str(out_p)
+
+    concat_txt = out_p.parent / f"concat_{os.urandom(3).hex()}.txt"
+    with open(concat_txt, "w") as f:
+        for seg in valid_segments:
+            f.write(f"file '{seg}'\n")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_txt),
+        "-c", "copy",
+        str(out_p),
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    finally:
+        concat_txt.unlink(missing_ok=True)
+
+    return str(out_p)
 
 
 @dataclass
@@ -542,11 +601,15 @@ def generate_video(
     subtitle_font_size: int = 24,
     first_frame: str | Path | None = None,
     last_frame: str | Path | None = None,
+    references: tuple | list | None = None,
 ) -> GenerationResult:
     """Core video and audio generation backend.
 
     Called by both CLI and Web UI.
     """
+    # Ensure active engine residency is VIDEO
+    model_manager.switch_to_engine("VIDEO")
+
     # Ensure target output directory is valid and writable (fallback to project outputs if macOS permission fails)
     target_out_dir = Path(output_dir).expanduser().resolve() if output_dir else OUTPUTS_DIR
     try:
@@ -583,6 +646,22 @@ def generate_video(
     paths = get_model_paths()
     actual_steps = paths.sampling_profile.resolve_steps(steps)
 
+    # Convert references to pipeline.Reference objects if supplied
+    ref_list = []
+    if references:
+        for r in references:
+            if isinstance(r, pipeline.Reference):
+                ref_list.append(r)
+            elif isinstance(r, dict):
+                ref_list.append(
+                    pipeline.Reference(
+                        image=r.get("image"),
+                        video=r.get("video"),
+                        audio=r.get("audio"),
+                        include_video_audio=r.get("include_video_audio", True),
+                    )
+                )
+
     def report_stage(stage_text: str, progress: float):
         if cancel_event and cancel_event.is_set():
             raise InterruptedError("Generation task was cancelled by user.")
@@ -591,7 +670,7 @@ def generate_video(
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {stage_text}", flush=True)
 
     report_stage("Checking models and system memory...", 0.02)
-    paths.validate(ref2va=False)
+    paths.validate(ref2va=bool(ref_list))
 
     memory.configure(budget_gib=28)
     guard = memory.Guard("generate", budget_gib=28, cancel_check=lambda: bool(cancel_event and cancel_event.is_set()))
@@ -612,12 +691,14 @@ def generate_video(
         steps=actual_steps,
         first_frame=first_frame,
         last_frame=last_frame,
+        references=tuple(ref_list),
     )
 
     peak_memory_bytes = 0
 
     def on_phase_report(item: pipeline.PhaseReport):
         if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation task was cancelled by user.")
             raise InterruptedError("Generation task was cancelled by user.")
         nonlocal peak_memory_bytes
         if item.peak > peak_memory_bytes:
@@ -754,6 +835,95 @@ def generate_video(
     finally:
         gc.collect()
         memory.release()
+
+
+def generate_long_video(
+    prompt: str,
+    target_duration_sec: float = 10.0,
+    segment_duration_sec: float = 2.0,
+    width: int = 768,
+    height: int = 448,
+    seed: int | None = None,
+    steps: int | None = None,
+    start_image: str | Path | None = None,
+    references: tuple | list | None = None,
+    on_stage: Callable[[str, float], None] | None = None,
+    output_dir: str | Path | None = None,
+    cancel_event: threading.Event | None = None,
+    subtitle_text: str | None = None,
+) -> GenerationResult:
+    """Generate a multi-segment continuous long video using sequential frame chaining."""
+    segment_count = max(1, int(round(target_duration_sec / segment_duration_sec)))
+    segment_paths = []
+    current_start_img = start_image
+    base_seed = seed if (seed is not None and seed >= 0) else random.randint(1, 2147483647)
+
+    target_out_dir = Path(output_dir).expanduser().resolve() if output_dir else OUTPUTS_DIR
+    target_out_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = target_out_dir / "temp_segments"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    for seg_idx in range(segment_count):
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Long video generation was cancelled by user.")
+
+        def seg_stage_wrapper(msg: str, prog: float):
+            overall_prog = (seg_idx + prog) / segment_count
+            if on_stage:
+                on_stage(f"[分段 {seg_idx+1}/{segment_count}] {msg}", overall_prog)
+
+        seg_res = generate_video(
+            prompt=prompt,
+            width=width,
+            height=height,
+            duration_sec=segment_duration_sec,
+            seed=base_seed + seg_idx,
+            steps=steps,
+            first_frame=current_start_img,
+            references=references,
+            on_stage=seg_stage_wrapper,
+            output_dir=temp_dir,
+            cancel_event=cancel_event,
+        )
+
+        if not seg_res.success or not seg_res.output_path:
+            raise RuntimeError(f"Segment #{seg_idx+1} generation failed: {seg_res.error_message}")
+
+        segment_paths.append(seg_res.output_path)
+
+        # Extract last frame for the next segment
+        if seg_idx < segment_count - 1:
+            next_frame_path = temp_dir / f"seg_{seg_idx+1}_last_frame.png"
+            current_start_img = extract_last_frame_from_video(seg_res.output_path, next_frame_path)
+
+    # Stitch all segments together
+    if on_stage:
+        on_stage("正在拼接全部分段影片 (FFmpeg Crossfade)...", 0.95)
+
+    final_time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+    final_filename = f"{final_time_str}_long_seed{base_seed}_{width}x{height}_{int(target_duration_sec)}s.mp4"
+    final_output_path = target_out_dir / final_filename
+
+    stitch_video_segments(segment_paths, final_output_path)
+
+    final_res = GenerationResult(
+        success=True,
+        output_path=str(final_output_path),
+        output_filename=final_filename,
+        output_dir=str(target_out_dir),
+        prompt=prompt.strip(),
+        seed=base_seed,
+        width=width,
+        height=height,
+        frames=resolve_frames(segment_duration_sec) * segment_count,
+        duration_sec=round(segment_duration_sec * segment_count, 2),
+        steps=steps or 10,
+        execution_time_sec=0,
+        peak_memory_gib=round(mx.get_peak_memory() / (1024**3), 2),
+        subtitle_text=subtitle_text,
+    )
+    append_history(final_res)
+    return final_res
 
 
 if __name__ == "__main__":

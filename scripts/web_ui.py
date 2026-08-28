@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Lightweight local Web UI for MiniMax-H3 on Apple Silicon with Prompt Queue and Post-Processing Subtitles."""
+"""Unified Local Generative Studio (色色 Studio) for Apple Silicon.
+
+Supports:
+- Unified Prompt Workspace (Text -> Image, Text -> Video, Image -> Video, Reference -> Video)
+- Native MLX Image Generation Engine (MFLUX / FLUX Schnell & Dev) with Dynamic Model Swap
+- MiniMax-H3 33B DiT Video Generation (T2V, I2V Start Frame, Reference, Long Mode Continuation)
+- Unified Asset Library & Batch Queue with Auto-continuation
+- Post-processing Subtitle Editor (Pillow / FFmpeg)
+- Dual View History Showcase (Grid / Compact List with Hide Item)
+"""
 
 from __future__ import annotations
 
@@ -23,21 +32,31 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
 OUTPUTS_DIR = BASE_DIR / "outputs"
+IMAGES_OUTPUT_DIR = OUTPUTS_DIR / "images"
+ASSETS_DIR = BASE_DIR / "assets"
 LOGS_DIR = BASE_DIR / "logs"
 QUEUE_FILE = LOGS_DIR / "queue.jsonl"
+ASSETS_FILE = LOGS_DIR / "assets.jsonl"
+
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import engine
+import image_engine
+import model_manager
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="MiniMax-H3 Local Studio")
+app = FastAPI(title="色色 Studio - Local Generative Studio")
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,6 +75,7 @@ CURRENT_JOB = {
     "error": None,
     "started_at": None,
     "prompt": "",
+    "job_type": "VIDEO",  # "VIDEO" or "IMAGE"
     "width": 768,
     "height": 448,
     "duration_sec": 2.0,
@@ -86,7 +106,6 @@ def load_queue_from_file():
                     if line:
                         try:
                             item = json.loads(line)
-                            # Reset running items to queued on restart
                             if item.get("status") == "running":
                                 item["status"] = "queued"
                             PROMPT_QUEUE.append(item)
@@ -98,7 +117,6 @@ def load_queue_from_file():
 
 def save_queue_to_file():
     try:
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
         with open(QUEUE_FILE, "w", encoding="utf-8") as f:
             for item in PROMPT_QUEUE:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -109,9 +127,26 @@ def save_queue_to_file():
 load_queue_from_file()
 
 
+# Request Models
+class ImageGenerateRequest(BaseModel):
+    prompt: str
+    width: int = 768
+    height: int = 768
+    steps: int = 4
+    seed: int = -1
+    model_name: str = "schnell"
+    quantize: int = 4
+    count: int = 1
+
+
 class GenerateRequest(BaseModel):
     prompt: str
     profile: str = "fast"
+    mode: str = "text"  # "text", "image", "reference"
+    start_image: str | None = None
+    references: list | None = None
+    long_mode: bool = False
+    target_duration_sec: float | None = None
     width: int = 768
     height: int = 448
     duration_sec: float = 2.0
@@ -124,6 +159,9 @@ class GenerateRequest(BaseModel):
 class BatchAddRequest(BaseModel):
     prompts_text: str
     profile: str = "fast"
+    mode: str = "text"
+    start_image: str | None = None
+    references: list | None = None
     width: int = 768
     height: int = 448
     duration_sec: float = 2.0
@@ -158,7 +196,6 @@ def summarize_error(err_str: str) -> str:
         return "🛑 使用者手動取消"
     if "swap" in low:
         return "⚠️ 虛擬記憶體交換過載 - 建議減少併發或重啟"
-    # Truncate clean message
     clean = err_str.replace("\n", " ").strip()
     return clean[:90] + ("..." if len(clean) > 90 else "")
 
@@ -173,11 +210,17 @@ def execute_generation_task(
     output_dir: str,
     queue_id: str | None = None,
     profile: str = "fast",
+    mode: str = "text",
+    start_image: str | None = None,
+    references: list | None = None,
+    long_mode: bool = False,
+    target_duration_sec: float | None = None,
 ):
     global CURRENT_JOB
     cancel_event = threading.Event()
     with JOB_LOCK:
         CURRENT_JOB["is_running"] = True
+        CURRENT_JOB["job_type"] = "VIDEO"
         CURRENT_JOB["stage"] = "Starting generation..."
         CURRENT_JOB["progress"] = 0.01
         CURRENT_JOB["result"] = None
@@ -211,22 +254,40 @@ def execute_generation_task(
     try:
         w = width
         h = height
-        dur = max(0.5, min(15.08, duration_sec))
+        dur = max(0.5, min(30.0, duration_sec))
         st = max(4, min(60, steps))
         seed_val = seed if seed >= 0 else None
         custom_out = output_dir.strip() if output_dir and output_dir.strip() else str(OUTPUTS_DIR)
 
-        res = engine.generate_video(
-            prompt=prompt,
-            width=w,
-            height=h,
-            duration_sec=dur,
-            seed=seed_val,
-            steps=st,
-            output_dir=custom_out,
-            cancel_event=cancel_event,
-            on_stage=on_stage,
-        )
+        if long_mode and target_duration_sec and target_duration_sec > dur:
+            res = engine.generate_long_video(
+                prompt=prompt,
+                target_duration_sec=target_duration_sec,
+                segment_duration_sec=dur,
+                width=w,
+                height=h,
+                seed=seed_val,
+                steps=st,
+                start_image=start_image if mode == "image" else None,
+                references=references if mode == "reference" else None,
+                output_dir=custom_out,
+                cancel_event=cancel_event,
+                on_stage=on_stage,
+            )
+        else:
+            res = engine.generate_video(
+                prompt=prompt,
+                width=w,
+                height=h,
+                duration_sec=dur,
+                seed=seed_val,
+                steps=st,
+                first_frame=start_image if mode == "image" else None,
+                references=references if mode == "reference" else None,
+                output_dir=custom_out,
+                cancel_event=cancel_event,
+                on_stage=on_stage,
+            )
 
         if not res.success:
             if "cancelled" in (res.error_message or "").lower() or (cancel_event and cancel_event.is_set()):
@@ -250,7 +311,6 @@ def execute_generation_task(
                 save_queue_to_file()
 
     except InterruptedError:
-        # User manually cancelled
         with JOB_LOCK:
             CURRENT_JOB["is_running"] = False
             CURRENT_JOB["stage"] = "Cancelled."
@@ -258,7 +318,6 @@ def execute_generation_task(
             CURRENT_JOB["progress"] = 0.0
             CURRENT_JOB["cancel_event"] = None
 
-        # Move to end of queue with cancelled status
         with QUEUE_LOCK:
             target_item = None
             if queue_id:
@@ -271,6 +330,7 @@ def execute_generation_task(
                     "id": str(uuid.uuid4())[:8],
                     "prompt": prompt,
                     "profile": profile,
+                    "mode": mode,
                     "width": width,
                     "height": height,
                     "duration_sec": duration_sec,
@@ -285,7 +345,6 @@ def execute_generation_task(
             save_queue_to_file()
 
     except Exception as e:
-        # Generation failed
         err_msg = str(e)
         friendly_err = summarize_error(err_msg)
         with JOB_LOCK:
@@ -295,7 +354,6 @@ def execute_generation_task(
             CURRENT_JOB["progress"] = 0.0
             CURRENT_JOB["cancel_event"] = None
 
-        # Move failed item to end of queue with error message
         with QUEUE_LOCK:
             target_item = None
             if queue_id:
@@ -308,6 +366,7 @@ def execute_generation_task(
                     "id": str(uuid.uuid4())[:8],
                     "prompt": prompt,
                     "profile": profile,
+                    "mode": mode,
                     "width": width,
                     "height": height,
                     "duration_sec": duration_sec,
@@ -331,12 +390,14 @@ def queue_worker_loop():
         with JOB_LOCK:
             if CURRENT_JOB["is_running"]:
                 continue
-        # Find next queued item
+
         next_item = None
         with QUEUE_LOCK:
             for item in PROMPT_QUEUE:
                 if item.get("status") == "queued":
                     next_item = item
+                    next_item["status"] = "running"
+                    save_queue_to_file()
                     break
         if next_item:
             threading.Thread(
@@ -351,6 +412,9 @@ def queue_worker_loop():
                     "output_dir": next_item.get("output_dir", ""),
                     "queue_id": next_item["id"],
                     "profile": next_item.get("profile", "fast"),
+                    "mode": next_item.get("mode", "text"),
+                    "start_image": next_item.get("start_image"),
+                    "references": next_item.get("references"),
                 },
                 daemon=True,
             ).start()
@@ -359,12 +423,14 @@ def queue_worker_loop():
 threading.Thread(target=queue_worker_loop, daemon=True).start()
 
 
+# API Endpoints
 @app.get("/api/status")
 async def get_status():
     mem = engine.get_system_memory_status()
     with JOB_LOCK:
         job_info = {
             "is_running": CURRENT_JOB["is_running"],
+            "job_type": CURRENT_JOB.get("job_type", "VIDEO"),
             "stage": CURRENT_JOB["stage"],
             "progress": round(CURRENT_JOB["progress"], 2),
             "elapsed_sec": round(time.time() - CURRENT_JOB["started_at"], 1) if CURRENT_JOB["started_at"] else 0,
@@ -376,6 +442,7 @@ async def get_status():
     return {
         "memory": mem,
         "job": job_info,
+        "active_engine": model_manager.get_active_engine(),
         "profiles": engine.PROFILES,
         "default_output_dir": str(OUTPUTS_DIR),
         "desktop_dir": str(Path("~/Desktop").expanduser().resolve()),
@@ -391,6 +458,7 @@ async def get_job():
         elapsed = round(time.time() - CURRENT_JOB["started_at"], 1) if CURRENT_JOB["started_at"] else 0
         return {
             "is_running": CURRENT_JOB["is_running"],
+            "job_type": CURRENT_JOB.get("job_type", "VIDEO"),
             "stage": CURRENT_JOB["stage"],
             "progress": round(CURRENT_JOB["progress"], 2),
             "elapsed_sec": elapsed,
@@ -399,6 +467,98 @@ async def get_job():
             "error": CURRENT_JOB["error"],
             "active_queue_id": CURRENT_JOB.get("active_queue_id"),
         }
+
+
+@app.post("/api/image/generate")
+async def generate_image_endpoint(req: ImageGenerateRequest):
+    """Generate image locally using MFLUX with dynamic memory swap."""
+    with JOB_LOCK:
+        if CURRENT_JOB["is_running"]:
+            raise HTTPException(status_code=409, detail="已有生成任務正在執行中，請稍候。")
+        CURRENT_JOB["is_running"] = True
+        CURRENT_JOB["job_type"] = "IMAGE"
+        CURRENT_JOB["stage"] = "正在載入圖片引擎並生成..."
+        CURRENT_JOB["progress"] = 0.05
+        CURRENT_JOB["started_at"] = time.time()
+        CURRENT_JOB["prompt"] = req.prompt.strip()
+        CURRENT_JOB["result"] = None
+        CURRENT_JOB["error"] = None
+
+    cancel_ev = threading.Event()
+    with JOB_LOCK:
+        CURRENT_JOB["cancel_event"] = cancel_ev
+
+    def on_img_prog(prog: float, msg: str):
+        with JOB_LOCK:
+            CURRENT_JOB["progress"] = prog
+            CURRENT_JOB["stage"] = msg
+
+    try:
+        results = image_engine.generate_images(
+            prompt=req.prompt,
+            width=req.width,
+            height=req.height,
+            steps=req.steps,
+            seed=req.seed,
+            model_name=req.model_name,
+            quantize=req.quantize,
+            count=req.count,
+            progress_callback=on_img_prog,
+            cancel_check=lambda: cancel_ev.is_set(),
+        )
+        with JOB_LOCK:
+            CURRENT_JOB["is_running"] = False
+            CURRENT_JOB["progress"] = 1.0
+            CURRENT_JOB["stage"] = "圖片生成完成！"
+            CURRENT_JOB["result"] = [image_engine.asdict(r) for r in results]
+            CURRENT_JOB["cancel_event"] = None
+        return {"status": "ok", "results": [image_engine.asdict(r) for r in results]}
+
+    except Exception as e:
+        err_msg = str(e)
+        with JOB_LOCK:
+            CURRENT_JOB["is_running"] = False
+            CURRENT_JOB["stage"] = "圖片生成失敗"
+            CURRENT_JOB["error"] = err_msg
+            CURRENT_JOB["progress"] = 0.0
+            CURRENT_JOB["cancel_event"] = None
+        raise HTTPException(status_code=500, detail=f"圖片生成失敗: {err_msg}")
+
+
+@app.get("/api/image/history")
+async def get_image_history_endpoint():
+    return image_engine.get_image_history(limit=40)
+
+
+@app.post("/api/assets/upload")
+async def upload_asset_endpoint(data: dict):
+    """Register local image path or base64 into assets."""
+    file_path = data.get("file_path")
+    prompt = data.get("prompt", "")
+    if not file_path or not Path(file_path).exists():
+        raise HTTPException(status_code=400, detail="無效的檔案路徑")
+    rec = image_engine.register_asset(
+        asset_type="IMAGE",
+        source="UPLOAD",
+        file_path=file_path,
+        prompt=prompt,
+    )
+    return {"status": "ok", "asset": rec}
+
+
+@app.get("/api/assets")
+async def get_assets_endpoint():
+    if not ASSETS_FILE.exists():
+        return []
+    records = []
+    with open(ASSETS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                try:
+                    records.append(json.loads(line.strip()))
+                except Exception:
+                    pass
+    return records[::-1]
 
 
 @app.post("/api/generate")
@@ -418,6 +578,11 @@ async def start_generation(req: GenerateRequest):
             "output_dir": req.output_dir,
             "queue_id": req.queue_id,
             "profile": req.profile,
+            "mode": req.mode,
+            "start_image": req.start_image,
+            "references": req.references,
+            "long_mode": req.long_mode,
+            "target_duration_sec": req.target_duration_sec,
         },
         daemon=True,
     )
@@ -431,7 +596,7 @@ async def cancel_generation():
         if not CURRENT_JOB["is_running"] or not CURRENT_JOB.get("cancel_event"):
             return {"status": "not_running"}
         CURRENT_JOB["cancel_event"].set()
-        CURRENT_JOB["stage"] = "Cancelling task..."
+        CURRENT_JOB["stage"] = "正在中斷任務並釋放顯存..."
     return {"status": "cancelling"}
 
 
@@ -448,11 +613,15 @@ async def batch_add_queue(req: BatchAddRequest):
         raise HTTPException(status_code=400, detail="請輸入至少一筆提示詞")
     added_items = []
     with QUEUE_LOCK:
-        for line in lines:
-            item = {
-                "id": str(uuid.uuid4())[:8],
-                "prompt": line,
+        for prompt_line in lines:
+            item_id = str(uuid.uuid4())[:8]
+            queue_item = {
+                "id": item_id,
+                "prompt": prompt_line,
                 "profile": req.profile,
+                "mode": req.mode,
+                "start_image": req.start_image,
+                "references": req.references,
                 "width": req.width,
                 "height": req.height,
                 "duration_sec": req.duration_sec,
@@ -464,15 +633,14 @@ async def batch_add_queue(req: BatchAddRequest):
                 "created_at": datetime.now().strftime("%H:%M:%S"),
                 "output_path": None,
             }
-            PROMPT_QUEUE.append(item)
-            added_items.append(item)
+            PROMPT_QUEUE.append(queue_item)
+            added_items.append(queue_item)
         save_queue_to_file()
     return {"status": "ok", "added_count": len(added_items), "items": PROMPT_QUEUE}
 
 
 @app.post("/api/queue/action")
-async def queue_action(req: QueueActionRequest):
-    global PROMPT_QUEUE
+async def handle_queue_action(req: QueueActionRequest):
     with QUEUE_LOCK:
         target_idx = None
         for idx, item in enumerate(PROMPT_QUEUE):
@@ -480,7 +648,7 @@ async def queue_action(req: QueueActionRequest):
                 target_idx = idx
                 break
         if target_idx is None:
-            raise HTTPException(status_code=404, detail="找不到指定排程項目")
+            raise HTTPException(status_code=404, detail="找不到指定的排程項目")
 
         item = PROMPT_QUEUE[target_idx]
         if req.action == "delete":
@@ -516,6 +684,9 @@ async def queue_action(req: QueueActionRequest):
                     "output_dir": popped.get("output_dir", ""),
                     "queue_id": popped["id"],
                     "profile": popped.get("profile", "fast"),
+                    "mode": popped.get("mode", "text"),
+                    "start_image": popped.get("start_image"),
+                    "references": popped.get("references"),
                 },
                 daemon=True,
             ).start()
@@ -538,13 +709,18 @@ async def burn_subtitles_endpoint(req: SubtitleBurnRequest):
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="請輸入字幕文字")
     v_path = Path(req.video_path).expanduser().resolve()
-    if not v_path.exists() or not v_path.is_file():
-        raise HTTPException(status_code=404, detail="找不到指定的影片檔案")
+    if not v_path.exists():
+        raise HTTPException(status_code=404, detail="找不到來源影片檔案")
+
+    time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_name = f"{v_path.stem}_sub_{time_str}.mp4"
+    out_path = v_path.parent / out_name
 
     try:
-        out_path = engine.burn_subtitles_to_video(
-            input_path=v_path,
-            text=req.text.strip(),
+        dest = engine.burn_subtitles_to_video_file(
+            input_video_path=v_path,
+            output_video_path=out_path,
+            subtitle_text=req.text.strip(),
             start_sec=req.start_sec,
             end_sec=req.end_sec,
             position=req.position,
@@ -553,8 +729,8 @@ async def burn_subtitles_endpoint(req: SubtitleBurnRequest):
         )
         return {
             "status": "ok",
-            "output_path": out_path,
-            "output_filename": Path(out_path).name,
+            "output_path": str(dest),
+            "output_filename": out_name,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"字幕壓制失敗: {e}")
@@ -562,7 +738,7 @@ async def burn_subtitles_endpoint(req: SubtitleBurnRequest):
 
 @app.get("/api/history")
 async def get_history():
-    return engine.get_history(limit=30)
+    return engine.get_history(limit=40)
 
 
 @app.get("/api/video-stream")
@@ -596,15 +772,16 @@ async def open_output_folder(data: dict):
 
 
 app.mount("/outputs", StaticFiles(directory=OUTPUTS_DIR), name="outputs")
+app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
 
-# Complete SPA HTML with Prompt Queue & Subtitle Editor
+# Complete SPA HTML
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh-TW" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MiniMax-H3 Local Studio</title>
+  <title>色色 Studio - 本機生成創作工作站</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -615,6 +792,7 @@ INDEX_HTML = """<!DOCTYPE html>
       --card-border: rgba(255, 255, 255, 0.08);
       --primary-accent: #6366f1;
       --primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
+      --image-gradient: linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%);
       --danger-gradient: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
       --text-main: #f3f4f6;
       --text-muted: #9ca3af;
@@ -639,7 +817,7 @@ INDEX_HTML = """<!DOCTYPE html>
       -webkit-backdrop-filter: blur(16px);
       background: rgba(11, 15, 23, 0.85);
       border-bottom: 1px solid var(--card-border);
-      padding: 1rem 2rem;
+      padding: 0.85rem 2rem;
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -655,9 +833,9 @@ INDEX_HTML = """<!DOCTYPE html>
       font-weight: 800; font-size: 1.2rem; color: white;
       box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
     }
-    .brand-text h1 { font-size: 1.15rem; font-weight: 700; }
+    .brand-text h1 { font-size: 1.15rem; font-weight: 700; letter-spacing: 0.5px; }
     .brand-text p { font-size: 0.75rem; color: var(--text-muted); }
-    .system-status { display: flex; align-items: center; gap: 1rem; font-size: 0.8rem; }
+    .system-status { display: flex; align-items: center; gap: 0.75rem; font-size: 0.8rem; }
     .status-pill {
       background: var(--card-bg); border: 1px solid var(--card-border);
       padding: 0.35rem 0.85rem; border-radius: 9999px;
@@ -672,11 +850,11 @@ INDEX_HTML = """<!DOCTYPE html>
     .indicator-dot.danger { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
 
     main {
-      flex: 1; max-width: 1360px; margin: 0 auto;
-      padding: 2rem 1.5rem; width: 100%;
-      display: grid; grid-template-columns: 1fr 1.1fr; gap: 2rem;
+      flex: 1; max-width: 1400px; margin: 0 auto;
+      padding: 1.5rem; width: 100%;
+      display: grid; grid-template-columns: 1.1fr 1fr; gap: 1.5rem;
     }
-    @media (max-width: 1024px) { main { grid-template-columns: 1fr; } }
+    @media (max-width: 1080px) { main { grid-template-columns: 1fr; } }
 
     .glass-card {
       background: var(--card-bg);
@@ -684,1211 +862,842 @@ INDEX_HTML = """<!DOCTYPE html>
       -webkit-backdrop-filter: blur(12px);
       border: 1px solid var(--card-border);
       border-radius: 16px;
-      padding: 1.5rem;
+      padding: 1.25rem;
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-      display: flex; flex-direction: column; gap: 1.25rem;
+      display: flex; flex-direction: column; gap: 1rem;
     }
 
     .card-title {
-      font-size: 1.1rem; font-weight: 700;
+      font-size: 1.05rem; font-weight: 700;
       display: flex; justify-content: space-between; align-items: center;
-      border-bottom: 1px solid var(--card-border); padding-bottom: 0.75rem;
+      border-bottom: 1px solid var(--card-border); padding-bottom: 0.6rem;
     }
 
-    .form-group { display: flex; flex-direction: column; gap: 0.5rem; }
-    label { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); display: flex; justify-content: space-between; }
+    /* Mode Navigation Tabs */
+    .mode-nav {
+      display: flex; gap: 0.5rem; background: rgba(11, 15, 23, 0.6);
+      padding: 0.3rem; border-radius: 10px; border: 1px solid var(--card-border);
+    }
+    .mode-tab {
+      flex: 1; text-align: center; padding: 0.45rem 0.6rem; border-radius: 8px;
+      font-size: 0.8rem; font-weight: 600; cursor: pointer; color: var(--text-muted);
+      transition: all 0.2s ease; border: 1px solid transparent;
+    }
+    .mode-tab:hover { color: var(--text-main); }
+    .mode-tab.active {
+      background: rgba(99, 102, 241, 0.25); color: #c7d2fe;
+      border-color: rgba(99, 102, 241, 0.4); box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+
+    .form-group { display: flex; flex-direction: column; gap: 0.4rem; }
+    label { font-size: 0.8rem; font-weight: 600; color: var(--text-muted); display: flex; justify-content: space-between; }
     textarea, select, input {
       background: rgba(11, 15, 23, 0.7); border: 1px solid var(--card-border);
-      color: var(--text-main); padding: 0.75rem 1rem; border-radius: 10px;
-      font-family: inherit; font-size: 0.95rem; outline: none; transition: 0.2s ease;
+      color: var(--text-main); padding: 0.65rem 0.85rem; border-radius: 10px;
+      font-family: inherit; font-size: 0.9rem; outline: none; transition: 0.2s ease;
     }
     textarea:focus, select:focus, input:focus {
       border-color: var(--primary-accent); box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
     }
-    textarea { min-height: 90px; resize: vertical; line-height: 1.5; }
+    textarea { min-height: 80px; resize: vertical; line-height: 1.45; }
 
-    .chips-container { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-    .chip {
-      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--card-border);
-      font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 6px;
-      cursor: pointer; color: var(--text-muted); transition: 0.15s ease;
+    /* Action Buttons Bar */
+    .btn-action-row {
+      display: grid; grid-template-columns: 1fr 1.3fr 1fr; gap: 0.6rem;
     }
-    .chip:hover { background: rgba(99, 102, 241, 0.2); color: var(--text-main); border-color: var(--primary-accent); }
-    .chip.active { background: rgba(99, 102, 241, 0.35); color: #c7d2fe; border-color: #818cf8; font-weight: 600; }
+    .btn-gen-img {
+      background: var(--image-gradient); border: none; color: white;
+      font-weight: 700; padding: 0.75rem; border-radius: 10px;
+      cursor: pointer; transition: 0.2s ease; font-size: 0.85rem;
+      box-shadow: 0 4px 14px rgba(6, 182, 212, 0.3);
+      display: flex; justify-content: center; align-items: center; gap: 0.35rem;
+    }
+    .btn-gen-vid {
+      background: var(--primary-gradient); border: none; color: white;
+      font-weight: 700; padding: 0.75rem; border-radius: 10px;
+      cursor: pointer; transition: 0.2s ease; font-size: 0.9rem;
+      box-shadow: 0 4px 16px rgba(99, 102, 241, 0.35);
+      display: flex; justify-content: center; align-items: center; gap: 0.4rem;
+    }
+    .btn-add-q {
+      background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15);
+      color: var(--text-main); font-weight: 600; padding: 0.75rem; border-radius: 10px;
+      cursor: pointer; transition: 0.2s ease; font-size: 0.85rem;
+      display: flex; justify-content: center; align-items: center; gap: 0.35rem;
+    }
+    .btn-gen-img:hover, .btn-gen-vid:hover, .btn-add-q:hover {
+      transform: translateY(-1px); filter: brightness(1.08);
+    }
 
-    .duration-control-box, .path-control-box {
+    /* Start Frame & Reference Dropzones */
+    .dropzone-box {
+      border: 2px dashed var(--card-border); border-radius: 10px;
+      padding: 0.85rem; background: rgba(11, 15, 23, 0.4); text-align: center;
+      cursor: pointer; transition: 0.2s ease; display: flex; align-items: center; gap: 0.75rem;
+    }
+    .dropzone-box:hover { border-color: var(--primary-accent); background: rgba(99, 102, 241, 0.05); }
+    .dropzone-preview {
+      width: 64px; height: 64px; border-radius: 8px; object-fit: cover;
+      background: #1f2937; border: 1px solid var(--card-border);
+    }
+
+    /* Generated Images Gallery */
+    .images-gallery-wrap {
+      display: flex; flex-direction: column; gap: 0.5rem;
       background: rgba(11, 15, 23, 0.5); border: 1px solid var(--card-border);
-      border-radius: 10px; padding: 0.85rem 1rem; display: flex; flex-direction: column; gap: 0.6rem;
+      border-radius: 10px; padding: 0.75rem;
     }
-    .duration-inputs { display: flex; align-items: center; gap: 1rem; }
-    .duration-num-input { width: 95px; font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 1.05rem; text-align: center; color: #818cf8; }
-    .duration-slider { flex: 1; height: 6px; accent-color: #6366f1; cursor: pointer; }
-    .duration-calc-badge { font-size: 0.75rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; display: flex; justify-content: space-between; }
+    .images-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 0.6rem;
+    }
+    .img-card {
+      background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border);
+      border-radius: 8px; overflow: hidden; display: flex; flex-direction: column;
+      transition: 0.2s ease;
+    }
+    .img-card:hover { border-color: #818cf8; transform: translateY(-2px); }
+    .img-card img {
+      width: 100%; aspect-ratio: 1/1; object-fit: cover; cursor: pointer;
+    }
+    .img-card-actions {
+      display: flex; flex-direction: column; gap: 0.2rem; padding: 0.35rem; background: rgba(11, 15, 23, 0.85);
+    }
+    .btn-card-mini {
+      background: rgba(255, 255, 255, 0.06); border: 1px solid var(--card-border);
+      color: var(--text-muted); font-size: 0.68rem; padding: 0.25rem 0.3rem; border-radius: 4px;
+      cursor: pointer; text-align: center; transition: 0.15s ease;
+    }
+    .btn-card-mini:hover { background: rgba(99, 102, 241, 0.25); color: #fff; border-color: var(--primary-accent); }
 
-    .path-row { display: flex; gap: 0.5rem; align-items: center; }
-    .path-input { flex: 1; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; padding: 0.6rem 0.8rem; }
+    /* Progress & Cancel Mini Button */
+    .progress-card {
+      background: linear-gradient(145deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
+      border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 12px; padding: 1rem;
+      display: flex; flex-direction: column; gap: 0.6rem; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    }
+    .progress-bar-bg {
+      background: rgba(255, 255, 255, 0.08); height: 8px; border-radius: 9999px; overflow: hidden;
+    }
+    .progress-fill {
+      background: var(--primary-gradient); height: 100%; width: 0%;
+      border-radius: 9999px; transition: width 0.3s ease;
+    }
+    .btn-cancel-mini {
+      background: rgba(239, 68, 68, 0.2); border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #fca5a5; font-size: 0.75rem; font-weight: 700; padding: 0.35rem 0.75rem;
+      border-radius: 6px; cursor: pointer; transition: 0.2s ease;
+    }
+    .btn-cancel-mini:hover { background: var(--danger-gradient); color: white; }
 
+    /* Queue & History */
+    .queue-card {
+      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
+      border-radius: 8px; padding: 0.65rem 0.85rem; display: flex; flex-direction: column;
+      gap: 0.4rem; transition: 0.2s ease;
+    }
+    .queue-card.running { border-color: var(--primary-accent); background: rgba(99, 102, 241, 0.08); }
+    .queue-card.completed { border-color: rgba(16, 185, 129, 0.3); }
+    .queue-header { display: flex; justify-content: space-between; align-items: center; }
+    .badge-status {
+      font-size: 0.7rem; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 600;
+    }
+    .badge-status.queued { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
+    .badge-status.running { background: rgba(99, 102, 241, 0.2); color: #818cf8; }
+    .badge-status.completed { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+    .badge-status.failed { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+    .badge-status.cancelled { background: rgba(156, 163, 175, 0.15); color: #9ca3af; }
+
+    .btn-tiny {
+      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--card-border);
+      color: var(--text-muted); font-size: 0.7rem; padding: 0.2rem 0.45rem; border-radius: 4px;
+      cursor: pointer; transition: 0.15s ease;
+    }
+    .btn-tiny:hover { background: rgba(255, 255, 255, 0.15); color: var(--text-main); }
+
+    /* Video Player */
+    .player-container {
+      background: #000; border-radius: 12px; overflow: hidden;
+      aspect-ratio: 16/9; position: relative; border: 1px solid var(--card-border);
+      display: flex; align-items: center; justify-content: center;
+    }
+    video { width: 100%; height: 100%; object-fit: contain; }
+    .empty-state { text-align: center; color: var(--text-muted); font-size: 0.85rem; padding: 2rem; }
+
+    /* Collapsible */
     .collapsible {
       border: 1px solid var(--card-border); border-radius: 10px;
       overflow: hidden; background: rgba(11, 15, 23, 0.4);
     }
     .collapsible-header {
-      padding: 0.75rem 1rem; cursor: pointer; display: flex;
+      padding: 0.65rem 0.85rem; cursor: pointer; display: flex;
       justify-content: space-between; align-items: center;
-      font-size: 0.85rem; font-weight: 600; color: var(--text-muted);
+      font-size: 0.8rem; font-weight: 600; color: var(--text-muted);
     }
-    .collapsible-content { padding: 1rem; display: none; flex-direction: column; gap: 1rem; border-top: 1px solid var(--card-border); }
+    .collapsible-content { padding: 0.85rem; display: none; flex-direction: column; gap: 0.75rem; border-top: 1px solid var(--card-border); }
     .collapsible.open .collapsible-content { display: flex; }
 
-    /* Button Actions */
-    .btn-row { display: flex; gap: 0.75rem; }
-    .btn-generate {
-      flex: 1.2; background: var(--primary-gradient); border: none; color: white;
-      font-size: 1.05rem; font-weight: 700; padding: 0.95rem; border-radius: 12px;
-      cursor: pointer; transition: all 0.25s ease; box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
-      display: flex; justify-content: center; align-items: center; gap: 0.5rem;
-    }
-    .btn-generate:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 24px rgba(99, 102, 241, 0.6); }
-    .btn-generate:disabled { cursor: not-allowed; transform: none; box-shadow: none; }
-
-    .btn-add-queue {
-      flex: 1; background: rgba(99, 102, 241, 0.16); border: 1px solid rgba(99, 102, 241, 0.45);
-      color: #e0e7ff; font-size: 0.95rem; font-weight: 700; padding: 0.95rem 1rem; border-radius: 12px;
-      cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; justify-content: center; gap: 0.4rem;
-    }
-    .btn-add-queue:hover {
-      background: rgba(99, 102, 241, 0.3); border-color: #818cf8; color: white; transform: translateY(-2px);
-      box-shadow: 0 4px 16px rgba(99, 102, 241, 0.25);
-    }
-
-    .btn-cancel-mini {
-      background: var(--danger-gradient); border: none; color: white;
-      font-size: 0.75rem; font-weight: 700; padding: 0.35rem 0.65rem; border-radius: 6px;
-      cursor: pointer; transition: all 0.2s ease; box-shadow: 0 2px 8px rgba(239, 68, 68, 0.35);
-      display: flex; align-items: center; gap: 0.3rem; flex-shrink: 0;
-    }
-    .btn-cancel-mini:hover { box-shadow: 0 4px 14px rgba(239, 68, 68, 0.6); transform: translateY(-1px); }
-
-    .btn-secondary {
-      background: rgba(255, 255, 255, 0.06); border: 1px solid var(--card-border);
-      color: var(--text-main); padding: 0.6rem 0.85rem; border-radius: 8px;
-      font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: 0.2s ease;
-      display: flex; align-items: center; justify-content: center; gap: 0.4rem; text-decoration: none;
-    }
-    .btn-secondary:hover { background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.2); }
-
-    .progress-box {
-      background: rgba(11, 15, 23, 0.95); border: 1px solid rgba(99, 102, 241, 0.4);
-      border-radius: 12px; padding: 1rem; display: none; flex-direction: column; gap: 0.75rem;
-      box-shadow: 0 4px 20px rgba(99, 102, 241, 0.15);
-    }
-    .progress-bar-bg { height: 8px; background: rgba(255, 255, 255, 0.1); border-radius: 4px; overflow: hidden; }
-    .progress-bar-fill { height: 100%; background: var(--primary-gradient); width: 0%; transition: width 0.3s ease; }
-    .stage-text { font-size: 0.85rem; color: #93c5fd; font-family: 'JetBrains Mono', monospace; }
-
-    /* Queue UI */
-    .queue-list { display: flex; flex-direction: column; gap: 0.6rem; max-height: 320px; overflow-y: auto; padding-right: 0.3rem; }
-    .queue-card {
-      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
-      border-radius: 8px; padding: 0.65rem 0.85rem; display: flex; flex-direction: column; gap: 0.4rem;
-      transition: 0.2s ease;
-    }
-    .queue-card.running { border-color: #10b981; background: rgba(16, 185, 129, 0.08); }
-    .queue-card.failed { border-color: rgba(239, 68, 68, 0.4); background: rgba(239, 68, 68, 0.05); }
-    .queue-header { display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; }
-    .badge-status {
-      padding: 0.2rem 0.5rem; border-radius: 4px; font-weight: 700; font-size: 0.7rem; text-transform: uppercase;
-    }
-    .badge-status.queued { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
-    .badge-status.running { background: rgba(16, 185, 129, 0.25); color: #34d399; }
-    .badge-status.completed { background: rgba(99, 102, 241, 0.2); color: #a5b4fc; }
-    .badge-status.failed { background: rgba(239, 68, 68, 0.25); color: #f87171; }
-    .badge-status.cancelled { background: rgba(156, 163, 175, 0.2); color: #9ca3af; }
-    .badge-status.paused { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
-    .queue-prompt-text { font-size: 0.85rem; color: var(--text-main); word-break: break-word; line-height: 1.35; }
-    .queue-actions { display: flex; gap: 0.4rem; justify-content: flex-end; align-items: center; }
-    .btn-tiny {
-      background: rgba(255, 255, 255, 0.06); border: 1px solid var(--card-border);
-      color: var(--text-main); font-size: 0.7rem; padding: 0.2rem 0.45rem; border-radius: 4px; cursor: pointer;
-    }
-    .btn-tiny:hover { background: rgba(255, 255, 255, 0.15); }
-
-    /* Player and Result */
-    .player-container {
-      border-radius: 12px; overflow: hidden; background: #000;
-      border: 1px solid var(--card-border); aspect-ratio: 16 / 9;
-      display: flex; align-items: center; justify-content: center; position: relative;
-    }
-    video { width: 100%; height: 100%; object-fit: contain; }
-    .empty-state { color: var(--text-muted); font-size: 0.9rem; text-align: center; padding: 2rem; }
-
-    .player-control-bar {
-      display: flex; justify-content: space-between; align-items: center;
-      background: rgba(11, 15, 23, 0.7); border: 1px solid var(--card-border);
-      border-radius: 10px; padding: 0.5rem 0.85rem; font-size: 0.8rem;
-    }
-    .play-mode-chips { display: flex; gap: 0.35rem; align-items: center; }
-    .play-chip {
-      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--card-border);
-      padding: 0.25rem 0.55rem; border-radius: 6px; cursor: pointer; font-size: 0.75rem; color: var(--text-muted);
-    }
-    .play-chip.active { background: rgba(99, 102, 241, 0.35); color: #c7d2fe; border-color: #818cf8; font-weight: 600; }
-
-    .metadata-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; }
-    .meta-card {
-      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
-      padding: 0.6rem; border-radius: 8px; text-align: center;
-    }
-    .meta-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
-    .meta-val { font-size: 0.95rem; font-weight: 700; color: var(--text-main); font-family: 'JetBrains Mono', monospace; margin-top: 0.2rem; }
-
-    /* History section & View modes */
-    .history-section { grid-column: 1 / -1; margin-top: 1rem; }
-    .history-grid {
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 1rem; max-height: 480px; overflow-y: auto; padding-right: 0.5rem; width: 100%;
-    }
-    .history-list-view {
-      display: flex; flex-direction: column; gap: 0.5rem; max-height: 480px; overflow-y: auto; padding-right: 0.5rem; width: 100%;
-    }
-    .history-item {
-      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
-      border-radius: 10px; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem;
-      cursor: pointer; transition: all 0.2s ease; position: relative;
-    }
-    .history-item:hover { border-color: var(--primary-accent); transform: translateY(-2px); }
-    .history-list-row {
-      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
-      border-radius: 8px; padding: 0.6rem 0.85rem; display: flex; align-items: center; justify-content: space-between;
-      gap: 0.75rem; cursor: pointer; transition: all 0.15s ease;
-    }
-    .history-list-row:hover { border-color: var(--primary-accent); background: rgba(99, 102, 241, 0.08); }
-    .history-video-thumb {
-      width: 100%; height: 140px; background: #000; border-radius: 6px;
-      overflow: hidden; display: flex; align-items: center; justify-content: center; position: relative;
-    }
-    .btn-hide-item {
-      position: absolute; top: 6px; right: 6px; background: rgba(0, 0, 0, 0.75);
-      border: 1px solid rgba(255, 255, 255, 0.2); color: #e5e7eb; border-radius: 4px;
-      width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
-      font-size: 0.75rem; cursor: pointer; transition: 0.15s ease; z-index: 5;
-    }
-    .btn-hide-item:hover { background: rgba(239, 68, 68, 0.85); border-color: #ef4444; color: white; }
-    .history-prompt { font-size: 0.8rem; color: var(--text-main); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.3; }
-    .history-footer { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
-
-    .toast-banner {
-      position: fixed; bottom: 20px; right: 20px;
-      background: rgba(30, 41, 59, 0.95); border: 1px solid var(--card-border);
+    .toast {
+      position: fixed; bottom: 2rem; right: 2rem;
+      background: rgba(15, 23, 42, 0.95); border: 1px solid var(--card-border);
       color: white; padding: 0.75rem 1.25rem; border-radius: 10px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.4); display: none; z-index: 100; font-size: 0.9rem; font-weight: 600;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5); z-index: 100;
+      display: none; font-size: 0.85rem;
     }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
-      <div class="brand-badge">H3</div>
+      <div class="brand-badge">色</div>
       <div class="brand-text">
-        <h1>MiniMax-H3 Local Studio</h1>
-        <p>Apple Silicon MLX 8-bit Native Inference</p>
+        <h1>色色 Studio</h1>
+        <p>Local Generative Studio · Apple Silicon MLX</p>
       </div>
     </div>
     <div class="system-status">
       <div class="status-pill">
-        <span class="indicator-dot" id="pressure-dot"></span>
-        <span id="pressure-text">RAM: Checking...</span>
+        <span>RAM:</span>
+        <span id="mem-used" style="color:#818cf8;">--</span> / <span id="mem-total">-- GB</span>
       </div>
-      <div class="status-pill" id="swap-pill">
-        <span>Swap: 0.0 GB</span>
+      <div class="status-pill">
+        <div id="status-indicator" class="indicator-dot"></div>
+        <span id="system-state-text">Ready</span>
       </div>
     </div>
   </header>
 
   <main>
-    <!-- Left: Unified Generation Controls & Prompt Queue -->
-    <div class="glass-card">
-      <div class="card-title">
-        <span>✨ 提示詞與排程生成 (Prompt & Queue)</span>
-        <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; font-size:0.8rem; font-weight:normal; color:var(--text-muted);">
-          <input type="checkbox" id="auto-queue-chk" onchange="toggleAutoQueue(this.checked)" checked>
-          <span>🔁 自動連續生成</span>
-        </label>
-      </div>
-
-      <!-- Single Unified Prompt Input for both Single & Batch -->
-      <div class="form-group">
-        <label for="prompt">Prompt (提示詞 / 支援單行或多行批次輸入)</label>
-        <textarea id="prompt" placeholder="可輸入單筆提示詞立即生成，亦可一次貼入多行提示詞（一行一筆）進行批次排程...&#10;例：&#10;A corgi running through a vibrant grassy field, golden hour lighting&#10;Cyberpunk city street at night, neon reflections in puddles&#10;A cute red panda eating bamboo leaves in misty mountain forest" style="min-height:105px;"></textarea>
-        <div class="chips-container">
-          <span class="chip" onclick="setPrompt(this.innerText)">A golden retriever catching a frisbee on the beach, splashing ocean waves</span>
-          <span class="chip" onclick="setPrompt(this.innerText)">Cyberpunk city street at night, neon reflections in puddles, flying cars</span>
-          <span class="chip" onclick="setPrompt(this.innerText)">A cute red panda eating bamboo leaves in misty mountain forest</span>
+    <!-- Left Column: Unified Workspace -->
+    <div style="display:flex; flex-direction:column; gap:1.25rem;">
+      <!-- Unified Prompt Box -->
+      <div class="glass-card">
+        <div class="card-title">
+          <span>✨ 統一提示詞工作區 (Unified Workspace)</span>
+          <span style="font-size:0.75rem; font-weight:400; color:var(--text-muted);">支援生圖 · 生影片 · 圖生影</span>
         </div>
-      </div>
 
-      <div class="form-group">
-        <label for="profile">Generation Profile</label>
-        <select id="profile" onchange="onProfileChange()">
-          <option value="fast" selected>⚡️ 快速測試 (768×448 / ~2s / 10 steps)</option>
-          <option value="standard">🎬 540p 標準 (960×544 / ~2.5s / 15 steps)</option>
-          <option value="720p_short">🌟 720p Short (1280×720 / ~2s / 15 steps)</option>
-          <option value="720p">💎 720p 標準 (1280×720 / ~3s / 20 steps)</option>
-          <option value="custom">⚙️ 自訂參數 (Custom)</option>
-        </select>
-      </div>
+        <!-- Video Conditioning Mode Switcher -->
+        <div class="mode-nav">
+          <div class="mode-tab active" id="tab-mode-text" onclick="switchVideoMode('text')">📝 純文字生影片</div>
+          <div class="mode-tab" id="tab-mode-image" onclick="switchVideoMode('image')">🖼️ 首幀圖生影片 (I2V)</div>
+          <div class="mode-tab" id="tab-mode-reference" onclick="switchVideoMode('reference')">🏷️ 參考特徵 (Ref)</div>
+        </div>
 
-      <!-- Duration Control -->
-      <div class="form-group">
-        <label>影片長度 (支援手動輸入秒數，上限 15.0 秒)</label>
-        <div class="duration-control-box">
-          <div class="duration-inputs">
-            <input type="number" id="duration-num" min="0.5" max="15.0" step="0.1" value="2.0" class="duration-num-input" oninput="onDurationNumInput(this.value)">
-            <span style="font-weight:600; color:var(--text-muted);">秒 (s)</span>
-            <input type="range" id="duration-slider" min="0.5" max="15.0" step="0.1" value="2.0" class="duration-slider" oninput="onDurationSliderInput(this.value)">
-          </div>
-          <div class="duration-calc-badge">
-            <span id="duration-frames-text">換算幀數: 56 幀 (約 2.33 秒)</span>
-            <span>建議安全範圍: 2.0s ~ 3.0s</span>
+        <!-- Start Image Panel (for I2V mode) -->
+        <div id="start-image-panel" style="display:none; flex-direction:column; gap:0.5rem;">
+          <label>🎬 影片起始幀 (Start Frame Image) <span style="font-size:0.7rem; color:#818cf8;">首幀像素注入 H3 FL2VA</span></label>
+          <div class="dropzone-box" onclick="document.getElementById('start-image-file').click();">
+            <img id="start-image-thumb" class="dropzone-preview" src="" style="display:none;" />
+            <div id="start-image-placeholder" style="flex:1;">
+              <span style="font-size:0.8rem; color:var(--text-muted);">點擊或拖曳上傳圖片 (或從下方已生成圖片點選「設為起始幀」)</span>
+            </div>
+            <button class="btn-tiny" id="btn-clear-start-image" style="display:none;" onclick="event.stopPropagation(); clearStartImage();">✕ 清除</button>
+            <input type="file" id="start-image-file" accept="image/*" style="display:none;" onchange="handleStartImageUpload(event);" />
           </div>
         </div>
-      </div>
 
-      <!-- Output Directory Selector -->
-      <div class="form-group">
-        <label>📁 影片產生位置 (Output Folder)</label>
-        <div class="path-control-box">
-          <div class="path-row">
-            <input type="text" id="output-dir" class="path-input" placeholder="/Users/.../outputs" onchange="saveOutputDir(this.value)">
-            <button class="btn-secondary" style="flex:0 0 auto; padding:0.55rem 0.85rem;" onclick="openCurrentFolder()" title="在 Finder 中開啟">📂 開啟</button>
-          </div>
-          <div class="chips-container" id="path-presets">
-            <span class="chip active" id="chip-default" onclick="selectPathPreset('default')">📁 專案預設</span>
-            <span class="chip" id="chip-desktop" onclick="selectPathPreset('desktop')">🖥️ 桌面 (Desktop)</span>
-            <span class="chip" id="chip-downloads" onclick="selectPathPreset('downloads')">📥 下載 (Downloads)</span>
-            <span class="chip" id="chip-movies" onclick="selectPathPreset('movies')">🎬 影片 (Movies)</span>
+        <!-- Reference Subjects Panel (for Reference mode) -->
+        <div id="reference-panel" style="display:none; flex-direction:column; gap:0.5rem;">
+          <label>🏷️ 角色 / 物件參考特徵 (Reference Subjects) <span style="font-size:0.7rem; color:#a855f7;">H3 多模態條件注入</span></label>
+          <div style="background:rgba(11,15,23,0.5); padding:0.6rem; border-radius:8px; border:1px solid var(--card-border); display:flex; flex-direction:column; gap:0.4rem;">
+            <div style="display:flex; gap:0.5rem; align-items:center;">
+              <input type="text" id="ref-subject-name" placeholder="主體名稱 (例如: Money / 女主角 / 跑車)" style="flex:1; font-size:0.8rem;" />
+              <button class="btn-tiny" onclick="addRefSubjectImage();">➕ 加圖</button>
+            </div>
+            <div id="ref-images-list" style="display:flex; gap:0.4rem; flex-wrap:wrap;"></div>
           </div>
         </div>
-      </div>
 
-      <!-- Advanced Drawer -->
-      <div class="collapsible" id="advanced-drawer">
-        <div class="collapsible-header" onclick="toggleDrawer('advanced-drawer', 'adv-arrow')">
-          <span>🛠️ 進階解析度與步數 (Advanced Settings)</span>
-          <span id="adv-arrow">▼</span>
+        <!-- Prompt Textarea -->
+        <div class="form-group">
+          <label for="prompt">
+            <span>創意提示詞 (Prompt)</span>
+            <span style="font-size:0.7rem; color:var(--text-muted);">多行自動支援批次排程</span>
+          </label>
+          <textarea id="prompt" placeholder="輸入描述 (例如: A cinematic shot of a happy golden retriever running in a park, soft sunlight filtering through trees)"></textarea>
         </div>
-        <div class="collapsible-content">
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
+
+        <!-- Action Buttons Bar -->
+        <div class="btn-action-row">
+          <button class="btn-gen-img" onclick="handleGenerateImageClick();" title="使用 MFLUX 快速生成 1~4 張圖片構圖">
+            <span>🖼️ 生成圖片</span>
+          </button>
+          <button class="btn-gen-vid" id="btn-gen-video" onclick="handleGenerateVideoClick();" title="立即開始生成影片">
+            <span>🚀 生成影片</span>
+          </button>
+          <button class="btn-add-q" onclick="handleAddToQueueClick();" title="將提示詞加入佇列排程">
+            <span>➕ 加入排程</span>
+          </button>
+        </div>
+
+        <!-- Generated Images Gallery -->
+        <div class="images-gallery-wrap" id="images-gallery-wrap">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:0.8rem; font-weight:700;">🖼️ 本機生成圖片庫 (Image Gallery)</span>
+            <button class="btn-tiny" onclick="fetchImageHistory();">🔄 重新整理</button>
+          </div>
+          <div class="images-grid" id="images-grid">
+            <span style="font-size:0.75rem; color:var(--text-muted);">尚無生成圖片，點擊「生成圖片」立即探索構圖！</span>
+          </div>
+        </div>
+
+        <!-- Video Profile & Settings Drawer -->
+        <div class="collapsible open">
+          <div class="collapsible-header" onclick="toggleCollapsible(this)">
+            <span>⚙️ 影片生成規格與長度設定</span>
+            <span>▼</span>
+          </div>
+          <div class="collapsible-content">
             <div class="form-group">
-              <label for="width">寬度 (Width)</label>
-              <input type="number" id="width" value="768" step="16" min="128" max="1344">
+              <label>影片規格檔位 (Profile)</label>
+              <select id="video-profile" onchange="handleProfileChange(this.value)">
+                <option value="fast" selected>⚡ 快速預覽 (768x448 · ~2.0s · 10 Steps)</option>
+                <option value="standard">🎬 標準長度 (960x544 · ~2.5s · 15 Steps)</option>
+                <option value="hd720">🌟 720p 高畫質 (1280x720 · ~2.0s · 15 Steps)</option>
+                <option value="long">📽️ 長影片分段延續模式 (Long Continuation)</option>
+                <option value="custom">🛠️ 自訂參數 (Custom)</option>
+              </select>
             </div>
-            <div class="form-group">
-              <label for="height">高度 (Height)</label>
-              <input type="number" id="height" value="448" step="16" min="128" max="1344">
+
+            <!-- Long Mode Target Duration -->
+            <div id="long-mode-box" style="display:none; flex-direction:column; gap:0.4rem; background:rgba(99,102,241,0.08); padding:0.6rem; border-radius:8px; border:1px solid rgba(99,102,241,0.25);">
+              <label style="color:#a5b4fc;">📽️ 長影片目標長度 (Target Duration)</label>
+              <select id="long-target-duration" style="font-family:'JetBrains Mono',monospace;">
+                <option value="5.0">5.0 秒 (約 2 個分段)</option>
+                <option value="10.0" selected>10.0 秒 (約 4~5 個分段)</option>
+                <option value="15.0">15.0 秒 (約 6~7 個分段)</option>
+                <option value="30.0">30.0 秒 (極長敘事鏡頭)</option>
+              </select>
             </div>
-          </div>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
-            <div class="form-group">
-              <label for="steps">Sampling Steps</label>
-              <input type="number" id="steps" value="10" min="4" max="50">
-            </div>
-            <div class="form-group">
-              <label for="seed">Seed (-1 為隨機)</label>
-              <input type="number" id="seed" value="-1">
+
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.6rem;">
+              <div class="form-group">
+                <label>解析度寬高</label>
+                <div style="display:flex; gap:0.3rem;">
+                  <input type="number" id="custom-w" value="768" style="width:50%;" />
+                  <input type="number" id="custom-h" value="448" style="width:50%;" />
+                </div>
+              </div>
+              <div class="form-group">
+                <label>採樣步數 (Steps)</label>
+                <input type="number" id="custom-steps" value="10" min="4" max="60" />
+              </div>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- Unified Action Buttons -->
-      <div class="btn-row">
-        <button class="btn-generate" id="btn-gen" onclick="handleGenerateClick()">
-          <span>🚀 立即生成 (Generate)</span>
-        </button>
-        <button class="btn-add-queue" id="btn-add-queue" onclick="handleAddToQueueClick()" title="將上方輸入的提示詞送入排程隊列（可單筆或貼入多行）">
-          <span>➕ 加入排程</span>
-        </button>
+      <!-- Prompt Queue Drawer -->
+      <div class="glass-card">
+        <div class="card-title">
+          <div style="display:flex; align-items:center; gap:0.5rem;">
+            <span>📋 排程隊列 (Queue)</span>
+            <span id="queue-count-badge" style="font-size:0.7rem; background:rgba(99,102,241,0.2); color:#a5b4fc; padding:0.15rem 0.5rem; border-radius:9999px;">0 筆</span>
+          </div>
+          <div style="display:flex; gap:0.4rem; align-items:center;">
+            <label style="font-size:0.75rem; cursor:pointer; display:flex; align-items:center; gap:0.3rem;">
+              <input type="checkbox" id="auto-queue-toggle" checked onchange="toggleAutoQueue();" />
+              <span>🔁 自動連續生成</span>
+            </label>
+          </div>
+        </div>
+        <div id="queue-list" style="display:flex; flex-direction:column; gap:0.5rem; max-height:280px; overflow-y:auto;">
+          <span style="font-size:0.75rem; color:var(--text-muted);">目前無排程工作。</span>
+        </div>
       </div>
+    </div>
 
-      <!-- Progress Box with dedicated Cancel Button -->
-      <div class="progress-box" id="progress-box">
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-          <span class="stage-text" id="stage-text">Preparing...</span>
-          <div style="display:flex; gap:0.6rem; align-items:center;">
-            <button class="btn-cancel-mini" id="btn-cancel" onclick="cancelCurrentGeneration()" title="立即安全中止當前生成">
-              <span>🛑 中止生成 (Cancel)</span>
-            </button>
-            <div style="display:flex; gap:0.4rem; align-items:center; font-family:'JetBrains Mono',monospace; font-size:0.8rem;">
-              <span id="stage-pct" style="color:#818cf8; font-weight:700;">0%</span>
-              <span id="time-text" style="color:var(--text-muted);">0s</span>
-            </div>
+    <!-- Right Column: Player & Subtitles & History -->
+    <div style="display:flex; flex-direction:column; gap:1.25rem;">
+      <!-- Active Progress Card (when running) -->
+      <div class="progress-card" id="progress-card" style="display:none;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size:0.85rem; font-weight:700; color:#818cf8;" id="progress-stage-text">正在初始化...</span>
+          <div style="display:flex; align-items:center; gap:0.6rem;">
+            <span style="font-size:0.85rem; font-family:'JetBrains Mono',monospace; color:#a5b4fc;" id="progress-pct-text">0%</span>
+            <button class="btn-cancel-mini" onclick="cancelCurrentTask();" title="立即安全中斷並釋放顯存">🛑 中止生成</button>
           </div>
         </div>
         <div class="progress-bar-bg">
-          <div class="progress-bar-fill" id="progress-bar"></div>
+          <div class="progress-fill" id="progress-fill"></div>
         </div>
       </div>
 
-      <!-- Unified Queue List Container -->
-      <div class="form-group" style="margin-top:0.5rem;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.25rem;">
-          <span style="font-size:0.85rem; font-weight:700; color:var(--text-muted); display:flex; align-items:center; gap:0.5rem;">
-            <span>📋 排程清單 (Queue)</span>
-            <span class="badge-status queued" id="queue-count-badge">0 筆待處理</span>
-          </span>
-          <button class="btn-tiny" onclick="fetchQueue()" title="重新整理排程">🔄 整理</button>
-        </div>
-        <div class="queue-list" id="queue-items-container">
-          <p style="color:var(--text-muted); font-size:0.8rem; padding:0.5rem 0;">目前排程隊列為空。在上方輸入提示詞後點擊「➕ 加入排程」即可新增。</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- Right: Result Showcase, Player & Post-Processing Subtitle Editor -->
-    <div class="glass-card">
-      <div class="card-title">
-        <span>🎬 影片播放與後期編輯</span>
-      </div>
-
-      <div class="player-container" id="player-wrap">
-        <div class="empty-state" id="empty-state">
-          點擊「立即生成」或從下方歷史紀錄選擇影片進行播放與字幕編輯
-        </div>
-        <video id="video-player" controls style="display:none;"></video>
-      </div>
-
-      <!-- Player Controls Toolbar -->
-      <div class="player-control-bar" id="player-toolbar" style="display:none;">
-        <div class="play-mode-chips">
-          <span style="color:var(--text-muted); font-size:0.75rem; margin-right:0.25rem;">播放模式:</span>
-          <span class="play-chip active" id="mode-single" onclick="setPlayMode('single')">⏸️ 單次播放</span>
-          <span class="play-chip" id="mode-loop" onclick="setPlayMode('loop')">🔁 循環播放</span>
-        </div>
-        <div style="display:flex; align-items:center; gap:0.5rem;">
-          <span style="color:var(--text-muted); font-size:0.75rem;">速度:</span>
-          <select id="play-speed" style="padding:0.25rem 0.5rem; font-size:0.75rem;" onchange="setPlaybackSpeed(this.value)">
-            <option value="0.5">0.5x</option>
-            <option value="0.75">0.75x</option>
-            <option value="1.0" selected>1.0x (標準)</option>
-            <option value="1.25">1.25x</option>
-            <option value="1.5">1.5x</option>
-            <option value="2.0">2.0x</option>
-          </select>
-          <button class="btn-secondary" style="padding:0.25rem 0.5rem; font-size:0.75rem;" onclick="replayVideo()" title="重新播放">🔄 重播</button>
-        </div>
-      </div>
-
-      <!-- Post-Processing Subtitle Editor (Always visible by default) -->
-      <div class="collapsible open" id="sub-editor-drawer">
-        <div class="collapsible-header" onclick="toggleDrawer('sub-editor-drawer', 'sub-edit-arrow')">
-          <span>💬 後期字幕編輯 (Subtitle & Caption Editor)</span>
-          <span id="sub-edit-arrow">▲</span>
-        </div>
-        <div class="collapsible-content">
-          <div class="form-group">
-            <label for="sub-text">字幕文字內容</label>
-            <input type="text" id="sub-text" placeholder="輸入要在此時間區間顯示的字幕內容...">
+      <!-- Player Wrap -->
+      <div class="glass-card" id="player-wrap">
+        <div class="card-title">
+          <span>🎬 預覽與播放中心</span>
+          <div style="display:flex; gap:0.4rem;" id="player-toolbar">
+            <select id="play-speed" style="font-size:0.75rem; padding:0.2rem 0.4rem;" onchange="setPlaySpeed(this.value)">
+              <option value="0.5">0.5x</option>
+              <option value="1.0" selected>1.0x</option>
+              <option value="1.5">1.5x</option>
+              <option value="2.0">2.0x</option>
+            </select>
+            <button class="btn-tiny" id="btn-loop" onclick="toggleLoop()">🔁 循環</button>
           </div>
-          <!-- Time Range Selectors -->
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
+        </div>
+
+        <div class="player-container">
+          <div class="empty-state" id="empty-state">
+            <div style="font-size:2.2rem; margin-bottom:0.5rem;">📽️</div>
+            <div>目前尚無載入影片</div>
+            <div style="font-size:0.75rem; margin-top:0.3rem;">點擊排程卡片、歷史紀錄或開始生成</div>
+          </div>
+          <video id="video-player" controls autoplay loop playsinline style="display:none;"></video>
+        </div>
+
+        <!-- Video Metadata Grid -->
+        <div id="meta-grid" style="display:none; grid-template-columns: repeat(4, 1fr); gap:0.4rem; font-size:0.75rem; font-family:'JetBrains Mono',monospace; background:rgba(11,15,23,0.6); padding:0.6rem; border-radius:8px;">
+          <div><span style="color:var(--text-muted);">解析度:</span> <span id="meta-res">--</span></div>
+          <div><span style="color:var(--text-muted);">時長:</span> <span id="meta-dur">--</span></div>
+          <div><span style="color:var(--text-muted);">Seed:</span> <span id="meta-seed">--</span></div>
+          <div><span style="color:var(--text-muted);">耗時:</span> <span id="meta-time">--</span></div>
+        </div>
+
+        <!-- Subtitle Editor Drawer -->
+        <div class="collapsible open" id="subtitles-drawer">
+          <div class="collapsible-header" onclick="toggleCollapsible(this)">
+            <span>💬 後期字幕編輯 (秒級快速壓制另存)</span>
+            <span>▼</span>
+          </div>
+          <div class="collapsible-content">
             <div class="form-group">
-              <label>開始時間 (秒)</label>
-              <div style="display:flex; gap:0.35rem;">
-                <input type="number" id="sub-start-sec" min="0.0" step="0.1" value="0.0" style="flex:1;">
-                <button class="btn-secondary" style="padding:0.4rem 0.6rem; font-size:0.75rem;" onclick="captureCurrentVideoTime('start')" title="設定為影片當前播放秒數">📍 抓取當前</button>
-              </div>
+              <input type="text" id="sub-text" placeholder="輸入要插入的字幕內容..." />
             </div>
-            <div class="form-group">
-              <label>結束時間 (秒)</label>
-              <div style="display:flex; gap:0.35rem;">
-                <input type="number" id="sub-end-sec" min="0.1" step="0.1" value="3.0" style="flex:1;">
-                <button class="btn-secondary" style="padding:0.4rem 0.6rem; font-size:0.75rem;" onclick="captureCurrentVideoTime('end')" title="設定為影片當前播放秒數">📍 抓取當前</button>
+            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:0.5rem;">
+              <div class="form-group">
+                <label>樣式</label>
+                <select id="sub-style">
+                  <option value="box" selected>🔳 半透明黑底框</option>
+                  <option value="classic">🔲 經典白字黑邊</option>
+                  <option value="highlight">🟨 高對比亮黃</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>位置</label>
+                <select id="sub-pos">
+                  <option value="bottom" selected>底部置中</option>
+                  <option value="top">頂部置中</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>操作</label>
+                <button class="btn-tiny" style="height:35px; background:rgba(99,102,241,0.25); color:#a5b4fc; font-weight:700;" onclick="burnSubtitles();">💾 壓制新影片</button>
               </div>
             </div>
           </div>
-          <!-- Style & Position Controls -->
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
-            <div class="form-group">
-              <label for="sub-style">字幕樣式</label>
-              <select id="sub-style">
-                <option value="box" selected>🔳 半透明黑底框 (清晰推薦)</option>
-                <option value="stroke">🔲 經典白字黑邊 (Classic)</option>
-                <option value="yellow">🟨 高對比亮黃 (High-Vis)</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label for="sub-pos">字幕位置</label>
-              <select id="sub-pos">
-                <option value="bottom" selected>⬇️ 底部置中 (Bottom)</option>
-                <option value="top">⬆️ 頂部置中 (Top)</option>
-              </select>
-            </div>
-          </div>
-          <div class="form-group">
-            <label for="sub-size">字體大小: <span id="sub-size-val" style="color:#6366f1;">26px</span></label>
-            <input type="range" id="sub-size" min="16" max="36" step="2" value="26" oninput="document.getElementById('sub-size-val').innerText=this.value+'px'">
-          </div>
-          <button class="btn-secondary" id="btn-burn-sub" style="background:var(--primary-gradient); color:white; border:none; padding:0.75rem; font-size:0.95rem; font-weight:700;" onclick="burnSubtitlesToCurrentVideo()">
-            <span>💾 另存為帶字幕新影片 (Save Subtitled Video)</span>
-          </button>
         </div>
       </div>
 
-      <div class="metadata-grid" id="meta-grid" style="display:none;">
-        <div class="meta-card">
-          <div class="meta-label">解析度</div>
-          <div class="meta-val" id="meta-res">768x448</div>
-        </div>
-        <div class="meta-card">
-          <div class="meta-label">長度 / 幀數</div>
-          <div class="meta-val" id="meta-dur">2.0s (56f)</div>
-        </div>
-        <div class="meta-card">
-          <div class="meta-label">Seed</div>
-          <div class="meta-val" id="meta-seed">42</div>
-        </div>
-        <div class="meta-card">
-          <div class="meta-label">Steps</div>
-          <div class="meta-val" id="meta-steps">10</div>
-        </div>
-        <div class="meta-card">
-          <div class="meta-label">生成耗時</div>
-          <div class="meta-val" id="meta-time">2.1 min</div>
-        </div>
-        <div class="meta-card">
-          <div class="meta-label">Peak Memory</div>
-          <div class="meta-val" id="meta-mem">27.0 GB</div>
-        </div>
-      </div>
-
-      <div class="action-row" id="action-row" style="display:none; display:flex; gap:0.75rem;">
-        <button class="btn-secondary" style="flex:1;" onclick="openOutputFolder()">📂 開啟所在資料夾</button>
-        <button class="btn-secondary" style="flex:1;" onclick="copyFilePath()">📋 複製檔案路徑</button>
-        <a class="btn-secondary" id="download-link" style="flex:1;" download>⬇️ 下載 MP4</a>
-      </div>
-    </div>
-
-    <!-- Bottom: Collapsible History with View Switcher and Hide Support -->
-    <div class="glass-card history-section collapsible open" id="history-drawer">
-      <div class="collapsible-header" style="padding:0.25rem 0; background:transparent; border-bottom:1px solid var(--card-border); padding-bottom:0.75rem;" onclick="toggleDrawer('history-drawer', 'history-arrow')">
-        <div style="display:flex; align-items:center; gap:0.75rem;">
-          <span style="font-size:1.1rem; font-weight:700; color:var(--text-main);">🕒 最近生成紀錄 (History)</span>
-          <span class="badge-status completed" id="history-count-badge">0 部影片</span>
-        </div>
-        <div style="display:flex; align-items:center; gap:0.75rem;" onclick="event.stopPropagation();">
-          <div class="chips-container" style="gap:0.3rem;">
-            <span class="chip active" id="view-grid" onclick="setHistoryView('grid')">🖼️ 網格模式</span>
-            <span class="chip" id="view-list" onclick="setHistoryView('list')">📋 列表模式</span>
-            <button class="btn-tiny" id="btn-unhide" style="display:none;" onclick="resetHiddenHistory()">👁️ 顯示已隱藏 (<span id="hidden-count">0</span>)</button>
+      <!-- History Showcase Drawer -->
+      <div class="glass-card">
+        <div class="card-title">
+          <div style="display:flex; align-items:center; gap:0.5rem;">
+            <span>🕒 最近生成紀錄 (History)</span>
+            <span id="history-count-badge" style="font-size:0.7rem; background:rgba(255,255,255,0.06); padding:0.15rem 0.5rem; border-radius:9999px;">0 部</span>
           </div>
-          <span id="history-arrow" style="cursor:pointer; color:var(--text-muted);" onclick="toggleDrawer('history-drawer', 'history-arrow')">▲</span>
+          <div style="display:flex; gap:0.3rem;">
+            <button class="btn-tiny" id="btn-view-grid" onclick="setHistoryView('grid')">🖼️ 網格</button>
+            <button class="btn-tiny" id="btn-view-list" onclick="setHistoryView('list')">📋 列表</button>
+          </div>
         </div>
-      </div>
-      <div class="collapsible-content" style="padding:1rem 0 0 0; border:none; display:flex;">
-        <div id="history-container" class="history-grid">
-          <p style="color:var(--text-muted); font-size:0.85rem;">目前尚無歷史紀錄。</p>
+        <div id="history-container" style="max-height:300px; overflow-y:auto; display:flex; flex-direction:column; gap:0.5rem;">
+          <span style="font-size:0.75rem; color:var(--text-muted);">尚無歷史紀錄。</span>
         </div>
       </div>
     </div>
   </main>
 
-  <div id="toast" class="toast-banner"></div>
+  <div id="toast" class="toast"></div>
 
   <script>
     let currentResult = null;
-    let lastToastError = null;
-    let playMode = 'single';
-    let serverPaths = { default: '', desktop: '', downloads: '', movies: '' };
+    let currentStartImagePath = null;
+    let currentRefSubjects = [];
+    let currentVideoMode = 'text';
     let historyViewMode = localStorage.getItem('minimax_history_view') || 'grid';
     let hiddenHistoryKeys = JSON.parse(localStorage.getItem('minimax_hidden_history') || '[]');
 
-    function showToast(msg, duration=3500) {
+    function showToast(msg, duration = 3000) {
       const toast = document.getElementById('toast');
       toast.innerText = msg;
       toast.style.display = 'block';
       setTimeout(() => { toast.style.display = 'none'; }, duration);
     }
 
-    function setPrompt(text) { document.getElementById('prompt').value = text; }
-
-    function toggleDrawer(drawerId, arrowId) {
-      const drawer = document.getElementById(drawerId);
-      drawer.classList.toggle('open');
-      document.getElementById(arrowId).innerText = drawer.classList.contains('open') ? '▲' : '▼';
+    function toggleCollapsible(el) {
+      el.parentElement.classList.toggle('open');
     }
 
-    function setPlayMode(mode) {
-      playMode = mode;
-      const player = document.getElementById('video-player');
-      document.getElementById('mode-single').classList.toggle('active', mode === 'single');
-      document.getElementById('mode-loop').classList.toggle('active', mode === 'loop');
-      player.loop = (mode === 'loop');
+    function switchVideoMode(mode) {
+      currentVideoMode = mode;
+      document.querySelectorAll('.mode-tab').forEach(t => t.classList.remove('active'));
+      const activeTab = document.getElementById(`tab-mode-${mode}`);
+      if (activeTab) activeTab.classList.add('active');
+
+      document.getElementById('start-image-panel').style.display = (mode === 'image') ? 'flex' : 'none';
+      document.getElementById('reference-panel').style.display = (mode === 'reference') ? 'flex' : 'none';
     }
 
-    function setPlaybackSpeed(speedVal) {
-      const player = document.getElementById('video-player');
-      player.playbackRate = parseFloat(speedVal);
-    }
-
-    function replayVideo() {
-      const player = document.getElementById('video-player');
-      player.currentTime = 0;
-      player.play().catch(()=>{});
-    }
-
-    function captureCurrentVideoTime(target) {
-      const player = document.getElementById('video-player');
-      const timeVal = (player && !isNaN(player.currentTime)) ? player.currentTime.toFixed(1) : "0.0";
-      if (target === 'start') {
-        document.getElementById('sub-start-sec').value = timeVal;
-      } else {
-        document.getElementById('sub-end-sec').value = timeVal;
-      }
-      showToast(`已設定${target === 'start' ? '開始' : '結束'}時間為 ${timeVal} 秒`, 1500);
-    }
-
-    function alignFrameCount(rawSec) {
-      const rawFrames = Math.max(5, Math.floor(rawSec * 24));
-      let aligned = rawFrames;
-      while (aligned % 17 !== 5) { aligned++; }
-      aligned = Math.min(aligned, 362);
-      const actualSec = (aligned / 24).toFixed(2);
-      return { frames: aligned, sec: actualSec };
-    }
-
-    function updateDurationDisplay(val) {
-      const num = parseFloat(val) || 2.0;
-      const clamped = Math.max(0.5, Math.min(15.0, num));
-      const info = alignFrameCount(clamped);
-      document.getElementById('duration-frames-text').innerText = `換算幀數: ${info.frames} 幀 (約 ${info.sec} 秒)`;
-      if (document.getElementById('sub-end-sec')) {
-        document.getElementById('sub-end-sec').value = info.sec;
+    function handleProfileChange(val) {
+      const longBox = document.getElementById('long-mode-box');
+      longBox.style.display = (val === 'long') ? 'flex' : 'none';
+      if (val === 'fast') {
+        document.getElementById('custom-w').value = 768;
+        document.getElementById('custom-h').value = 448;
+        document.getElementById('custom-steps').value = 10;
+      } else if (val === 'standard') {
+        document.getElementById('custom-w').value = 960;
+        document.getElementById('custom-h').value = 544;
+        document.getElementById('custom-steps').value = 15;
+      } else if (val === 'hd720') {
+        document.getElementById('custom-w').value = 1280;
+        document.getElementById('custom-h').value = 720;
+        document.getElementById('custom-steps').value = 15;
+      } else if (val === 'long') {
+        document.getElementById('custom-w').value = 768;
+        document.getElementById('custom-h').value = 448;
+        document.getElementById('custom-steps').value = 10;
       }
     }
 
-    function onDurationNumInput(val) {
-      const num = parseFloat(val);
-      if (!isNaN(num)) {
-        document.getElementById('duration-slider').value = Math.max(0.5, Math.min(15.0, num));
-        updateDurationDisplay(num);
+    // Start Image Handler
+    function setStartImage(filePath) {
+      currentStartImagePath = filePath;
+      switchVideoMode('image');
+      const thumb = document.getElementById('start-image-thumb');
+      const placeholder = document.getElementById('start-image-placeholder');
+      const clearBtn = document.getElementById('btn-clear-start-image');
+      thumb.src = `/api/video-stream?path=${encodeURIComponent(filePath)}`;
+      thumb.style.display = 'block';
+      placeholder.style.display = 'none';
+      clearBtn.style.display = 'block';
+      showToast('🎬 已設定為影片起始幀 (I2V)！');
+    }
+
+    function clearStartImage() {
+      currentStartImagePath = null;
+      document.getElementById('start-image-thumb').style.display = 'none';
+      document.getElementById('start-image-placeholder').style.display = 'block';
+      document.getElementById('btn-clear-start-image').style.display = 'none';
+    }
+
+    async function handleStartImageUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      showToast('正在載入圖片...');
+      // Read local filepath or save
+      setStartImage(file.path || file.name);
+    }
+
+    // Image Generation API
+    async function handleGenerateImageClick() {
+      const prompt = document.getElementById('prompt').value.trim();
+      if (!prompt) {
+        showToast('⚠️ 請先輸入提示詞！');
+        return;
+      }
+      showToast('🎨 開始使用 MFLUX 生成圖片...');
+      try {
+        const res = await fetch('/api/image/generate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            prompt: prompt,
+            width: 768,
+            height: 768,
+            steps: 4,
+            model_name: 'schnell',
+            quantize: 4,
+            count: 1
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '圖片生成失敗');
+        showToast('✅ 圖片生成成功！');
+        await fetchImageHistory();
+      } catch (e) {
+        showToast(`❌ ${e.message}`);
       }
     }
 
-    function onDurationSliderInput(val) {
-      document.getElementById('duration-num').value = parseFloat(val).toFixed(1);
-      updateDurationDisplay(val);
+    async function fetchImageHistory() {
+      try {
+        const res = await fetch('/api/image/history');
+        const items = await res.json();
+        const grid = document.getElementById('images-grid');
+        if (!items || items.length === 0) {
+          grid.innerHTML = `<span style="font-size:0.75rem; color:var(--text-muted);">尚無生成圖片。</span>`;
+          return;
+        }
+        grid.innerHTML = items.slice(0, 8).map(img => `
+          <div class="img-card">
+            <img src="/api/video-stream?path=${encodeURIComponent(img.output_path)}" onclick="setStartImage('${img.output_path}')" title="點擊設為起始幀" />
+            <div class="img-card-actions">
+              <button class="btn-card-mini" onclick="setStartImage('${img.output_path}')">🎬 設起始幀</button>
+              <button class="btn-card-mini" onclick="openOutputFolder('${img.output_path}')">📂 Finder</button>
+            </div>
+          </div>
+        `).join('');
+      } catch (e) {}
     }
 
-    function selectPathPreset(presetKey) {
-      document.querySelectorAll('#path-presets .chip').forEach(c => c.classList.remove('active'));
-      const activeChip = document.getElementById('chip-' + presetKey);
-      if (activeChip) activeChip.classList.add('active');
-      const targetPath = serverPaths[presetKey] || '';
-      if (targetPath) {
-        document.getElementById('output-dir').value = targetPath;
-        localStorage.setItem('minimax_output_dir', targetPath);
+    // Video Generation API
+    async function handleGenerateVideoClick() {
+      const prompt = document.getElementById('prompt').value.trim();
+      if (!prompt) {
+        showToast('⚠️ 請輸入提示詞！');
+        return;
+      }
+      const prof = document.getElementById('video-profile').value;
+      const isLong = (prof === 'long');
+      const targetDur = isLong ? parseFloat(document.getElementById('long-target-duration').value) : null;
+
+      try {
+        const res = await fetch('/api/generate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            prompt: prompt,
+            profile: prof,
+            mode: currentVideoMode,
+            start_image: currentStartImagePath,
+            long_mode: isLong,
+            target_duration_sec: targetDur,
+            width: parseInt(document.getElementById('custom-w').value),
+            height: parseInt(document.getElementById('custom-h').value),
+            steps: parseInt(document.getElementById('custom-steps').value),
+            duration_sec: isLong ? 2.0 : 2.0
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '啟動失敗');
+        showToast('🚀 已啟動生成任務！');
+      } catch (e) {
+        showToast(`❌ ${e.message}`);
       }
     }
 
-    function saveOutputDir(val) {
-      localStorage.setItem('minimax_output_dir', val.trim());
-      document.querySelectorAll('#path-presets .chip').forEach(c => c.classList.remove('active'));
-      if (val === serverPaths.default) document.getElementById('chip-default').classList.add('active');
-      else if (val === serverPaths.desktop) document.getElementById('chip-desktop').classList.add('active');
-      else if (val === serverPaths.downloads) document.getElementById('chip-downloads').classList.add('active');
-      else if (val === serverPaths.movies) document.getElementById('chip-movies').classList.add('active');
-    }
-
-    function openCurrentFolder() {
-      const dir = document.getElementById('output-dir').value.trim();
-      fetch('/api/open-folder', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({dir_path: dir})
-      });
-    }
-
-    function onProfileChange() {
-      const p = document.getElementById('profile').value;
-      if (p === 'fast') {
-        document.getElementById('width').value = 768;
-        document.getElementById('height').value = 448;
-        document.getElementById('duration-num').value = 2.0;
-        document.getElementById('duration-slider').value = 2.0;
-        document.getElementById('steps').value = 10;
-      } else if (p === 'standard') {
-        document.getElementById('width').value = 960;
-        document.getElementById('height').value = 544;
-        document.getElementById('duration-num').value = 2.5;
-        document.getElementById('duration-slider').value = 2.5;
-        document.getElementById('steps').value = 15;
-      } else if (p === '720p_short') {
-        document.getElementById('width').value = 1280;
-        document.getElementById('height').value = 720;
-        document.getElementById('duration-num').value = 2.0;
-        document.getElementById('duration-slider').value = 2.0;
-        document.getElementById('steps').value = 15;
-      } else if (p === '720p') {
-        document.getElementById('width').value = 1280;
-        document.getElementById('height').value = 720;
-        document.getElementById('duration-num').value = 3.0;
-        document.getElementById('duration-slider').value = 3.0;
-        document.getElementById('steps').value = 20;
+    async function handleAddToQueueClick() {
+      const prompt = document.getElementById('prompt').value.trim();
+      if (!prompt) {
+        showToast('⚠️ 請輸入提示詞！');
+        return;
       }
-      updateDurationDisplay(document.getElementById('duration-num').value);
+      try {
+        const res = await fetch('/api/queue/batch-add', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            prompts_text: prompt,
+            profile: document.getElementById('video-profile').value,
+            mode: currentVideoMode,
+            start_image: currentStartImagePath,
+            width: parseInt(document.getElementById('custom-w').value),
+            height: parseInt(document.getElementById('custom-h').value),
+            steps: parseInt(document.getElementById('custom-steps').value),
+            duration_sec: 2.0
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '加入排程失敗');
+        showToast(`➕ 已加入 ${data.added_count} 筆排程！`);
+        await fetchQueue();
+      } catch (e) {
+        showToast(`❌ ${e.message}`);
+      }
     }
 
-    /* Queue Operations */
+    async function cancelCurrentTask() {
+      await fetch('/api/generate/cancel', {method: 'POST'});
+      showToast('🛑 已發送中斷請求...');
+    }
+
+    // Queue API
     async function fetchQueue() {
       try {
         const res = await fetch('/api/queue');
-        if (!res.ok) return;
         const data = await res.json();
-        renderQueueList(data.items || []);
-        const autoChk = document.getElementById('auto-queue-chk');
-        if (autoChk && typeof data.auto_enabled === 'boolean') {
-          autoChk.checked = data.auto_enabled;
-        }
-      } catch(e) {}
+        renderQueue(data.items || []);
+      } catch (e) {}
     }
 
-    function renderQueueList(items) {
-      const container = document.getElementById('queue-items-container');
-      const badge = document.getElementById('queue-count-badge');
-      const queuedCount = items.filter(i => i.status === 'queued').length;
-      badge.innerText = `${queuedCount} 筆待處理`;
-
-      if (!items || items.length === 0) {
-        container.innerHTML = '<p style="color:var(--text-muted); font-size:0.8rem; padding:0.5rem 0;">目前排程隊列為空。在上方輸入提示詞後點擊「➕ 加入排程」即可新增。</p>';
+    function renderQueue(items) {
+      document.getElementById('queue-count-badge').innerText = `${items.length} 筆`;
+      const container = document.getElementById('queue-list');
+      if (items.length === 0) {
+        container.innerHTML = `<span style="font-size:0.75rem; color:var(--text-muted);">目前無排程工作。</span>`;
         return;
       }
-
       container.innerHTML = items.map((item, idx) => {
+        const isDone = item.status === 'completed';
         const isRun = item.status === 'running';
-        const isFail = item.status === 'failed';
-        const isCancel = item.status === 'cancelled';
-        const isCompleted = item.status === 'completed';
-        const statusMap = {
-          'queued': '⏳ 排程中',
-          'running': '▶️ 生成中',
-          'completed': '✅ 已完成',
-          'failed': '❌ 失敗',
-          'cancelled': '🛑 已取消',
-          'paused': '⏸️ 已暫停'
-        };
         return `
-          <div class="queue-card ${item.status}" ${isCompleted ? `onclick='playQueueItem(${JSON.stringify(item)})' style="cursor:pointer;"` : ''}>
+          <div class="queue-card ${item.status}" ${isDone ? `onclick='playQueueItem(${JSON.stringify(item)})' style="cursor:pointer;"` : ''}>
             <div class="queue-header">
               <div style="display:flex; align-items:center; gap:0.4rem;">
                 <span style="color:var(--text-muted); font-family:'JetBrains Mono',monospace;">#${idx+1}</span>
-                <span class="badge-status ${item.status}">${statusMap[item.status] || item.status}</span>
-                <span style="color:var(--text-muted); font-size:0.7rem;">${item.width}x${item.height} · ${item.duration_sec}s · ${item.steps}st</span>
+                <span class="badge-status ${item.status}">${item.status.toUpperCase()}</span>
+                <span style="color:var(--text-muted); font-size:0.7rem;">${item.width}x${item.height} · ${item.steps}st</span>
               </div>
-              <div class="queue-actions" onclick="event.stopPropagation();">
-                ${isCompleted ? `<button class="btn-tiny" style="background:rgba(99,102,241,0.25); color:#a5b4fc; font-weight:700;" onclick='playQueueItem(${JSON.stringify(item)})' title="在播放器中播放此影片">▶️ 播放</button>` : ''}
-                ${isCompleted && item.output_path ? `<button class="btn-tiny" onclick="openOutputFolderForPath('${item.output_path}')" title="開啟所在資料夾">📂</button>` : ''}
-                ${(isFail || isCancel || isCompleted) ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'retry')" title="重新排程">🔄 Retry</button>` : ''}
-                ${item.status === 'queued' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'run_now')" title="立即開始執行">⚡ 立即</button>` : ''}
-                ${item.status === 'queued' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'pause')" title="暫停">⏸️</button>` : ''}
-                ${item.status === 'paused' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'resume')" title="恢復">▶️</button>` : ''}
-                <button class="btn-tiny" onclick="queueAction('${item.id}', 'delete')" title="刪除">🗑️</button>
+              <div onclick="event.stopPropagation();" style="display:flex; gap:0.3rem;">
+                ${isDone ? `<button class="btn-tiny" style="background:rgba(99,102,241,0.25); color:#a5b4fc; font-weight:700;" onclick='playQueueItem(${JSON.stringify(item)})'>▶️ 播放</button>` : ''}
+                ${isDone && item.output_path ? `<button class="btn-tiny" onclick="openOutputFolder('${item.output_path}')">📂</button>` : ''}
+                <button class="btn-tiny" onclick="queueAction('${item.id}', 'delete')">🗑️</button>
               </div>
             </div>
-            <div class="queue-prompt-text">${item.prompt}</div>
-            ${item.error_message ? `<div style="font-size:0.75rem; color:#f87171; background:rgba(239,68,68,0.1); padding:0.25rem 0.5rem; border-radius:4px;">${item.error_message}</div>` : ''}
+            <div style="font-size:0.8rem; color:var(--text-main);">${item.prompt}</div>
           </div>
         `;
       }).join('');
     }
 
+    async function queueAction(id, act) {
+      await fetch('/api/queue/action', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({item_id: id, action: act})
+      });
+      await fetchQueue();
+    }
+
     function playQueueItem(item) {
       if (!item) return;
       displayResult(item);
-      const playerWrap = document.getElementById('player-wrap');
-      if (playerWrap) {
-        playerWrap.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
-      showToast(`🎬 載入影片：${(item.prompt || '').slice(0, 20)}...`);
-    }
-
-    function openOutputFolderForPath(path) {
-      fetch('/api/open-folder', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({file_path: path})
-      });
-    }
-
-    async function handleAddToQueueClick() {
-      const text = document.getElementById('prompt').value.trim();
-      if (!text) {
-        showToast("請在上方輸入提示詞（可單筆或貼入多行批次）");
-        return;
-      }
-      const profile = document.getElementById('profile').value;
-      const width = parseInt(document.getElementById('width').value, 10) || 768;
-      const height = parseInt(document.getElementById('height').value, 10) || 448;
-      const duration_sec = parseFloat(document.getElementById('duration-num').value) || 2.0;
-      const steps = parseInt(document.getElementById('steps').value, 10) || 10;
-      const seed = parseInt(document.getElementById('seed').value, 10);
-      const output_dir = document.getElementById('output-dir').value.trim();
-
-      try {
-        const res = await fetch('/api/queue/batch-add', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ prompts_text: text, profile, width, height, duration_sec, steps, seed, output_dir })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          renderQueueList(data.items || []);
-          showToast(`已成功加入 ${data.added_count} 筆提示詞至排程隊列！`);
-        }
-      } catch(e) { showToast("加入排程失敗"); }
-    }
-
-    async function queueAction(itemId, action) {
-      try {
-        const res = await fetch('/api/queue/action', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ item_id: itemId, action })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          renderQueueList(data.items || []);
-          syncJobState();
-        } else {
-          const err = await res.json();
-          showToast(err.detail || "操作失敗");
-        }
-      } catch(e) {}
-    }
-
-    async function toggleAutoQueue(enabled) {
-      try {
-        await fetch('/api/queue/toggle-auto', { method: 'POST' });
-        showToast(enabled ? "已啟用自動連續排程生成" : "已暫停自動連續生成");
-      } catch(e) {}
-    }
-
-    /* Subtitle Burn-In */
-    async function burnSubtitlesToCurrentVideo() {
-      let videoPath = null;
-      if (currentResult && (currentResult.output_path || currentResult.output_filename)) {
-        videoPath = currentResult.output_path || (serverPaths.default + '/' + currentResult.output_filename);
-      }
-      if (!videoPath) {
-        showToast("請先生成影片或從下方歷史紀錄點選一部影片進行字幕編輯");
-        return;
-      }
-      const text = document.getElementById('sub-text').value.trim();
-      if (!text) {
-        showToast("請輸入字幕文字內容");
-        return;
-      }
-      const startSec = parseFloat(document.getElementById('sub-start-sec').value) || 0.0;
-      const endSec = parseFloat(document.getElementById('sub-end-sec').value) || null;
-      const style = document.getElementById('sub-style').value;
-      const position = document.getElementById('sub-pos').value;
-      const fontSize = parseInt(document.getElementById('sub-size').value, 10) || 26;
-
-      const btn = document.getElementById('btn-burn-sub');
-      btn.disabled = true;
-      btn.innerHTML = '<span>⏳ 正在快速壓制字幕... (約 1~2 秒)</span>';
-
-      try {
-        const res = await fetch('/api/subtitles/burn', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            video_path: videoPath,
-            text, start_sec: startSec, end_sec: endSec,
-            style, position, font_size: fontSize
-          })
-        });
-        if (!res.ok) {
-          const err = await res.json();
-          showToast("字幕壓制失敗: " + (err.detail || "未知錯誤"));
-          return;
-        }
-        const data = await res.json();
-        showToast("✨ 帶字幕新影片另存成功！");
-        // Switch player to newly subtitled video
-        const newResult = Object.assign({}, currentResult, {
-          output_path: data.output_path,
-          output_filename: data.output_filename
-        });
-        displayResult(newResult);
-        fetchHistory();
-      } catch (e) {
-        showToast("壓制失敗，請確認檔案路徑");
-      } finally {
-        btn.disabled = false;
-        btn.innerHTML = '<span>💾 另存為帶字幕新影片 (Save Subtitled Video)</span>';
-      }
-    }
-
-    async function cancelCurrentGeneration() {
-      try {
-        const btn = document.getElementById('btn-cancel');
-        if (btn) {
-          btn.innerText = '中止中...';
-          btn.disabled = true;
-        }
-        await fetch('/api/generate/cancel', { method: 'POST' });
-        showToast("已發送中止訊號，正在釋放 Metal 記憶體...");
-      } catch(e) {}
-    }
-
-    async function fetchStatus() {
-      try {
-        const res = await fetch('/api/status');
-        if (!res.ok) return;
-        const data = await res.json();
-        const mem = data.memory;
-        const pDot = document.getElementById('pressure-dot');
-        const pText = document.getElementById('pressure-text');
-        const swapPill = document.getElementById('swap-pill');
-
-        pText.innerText = `RAM: ${mem.pressure} (Free ${mem.free_pct}%)`;
-        swapPill.innerText = `Swap: ${mem.swap_used_gib} GB`;
-        pDot.className = 'indicator-dot ' + (mem.pressure === 'Warning' ? 'warning' : (mem.pressure === 'Critical' ? 'danger' : ''));
-
-        if (!serverPaths.default) {
-          serverPaths.default = data.default_output_dir;
-          serverPaths.desktop = data.desktop_dir;
-          serverPaths.downloads = data.downloads_dir;
-          serverPaths.movies = data.movies_dir;
-
-          const saved = localStorage.getItem('minimax_output_dir');
-          if (saved) {
-            document.getElementById('output-dir').value = saved;
-            saveOutputDir(saved);
-          } else {
-            document.getElementById('output-dir').value = data.default_output_dir;
-          }
-        }
-      } catch(e) {}
-    }
-
-    async function syncJobState() {
-      try {
-        const res = await fetch('/api/job');
-        if (!res.ok) return;
-        const job = await res.json();
-
-        if (job.is_running) {
-          showRunning(job);
-        } else {
-          showIdle();
-          if (job.result) {
-            if (!currentResult || currentResult.output_filename !== job.result.output_filename) {
-              displayResult(job.result);
-              fetchHistory();
-            }
-          } else if (job.error) {
-            if (lastToastError !== job.error) {
-              lastToastError = job.error;
-              showToast("任務中斷: " + job.error);
-            }
-          }
-        }
-      } catch (e) {}
-    }
-
-    /* History Management: Grid/List View & Hide Individual Items */
-    function setHistoryView(mode) {
-      historyViewMode = mode;
-      localStorage.setItem('minimax_history_view', mode);
-      document.getElementById('view-grid').classList.toggle('active', mode === 'grid');
-      document.getElementById('view-list').classList.toggle('active', mode === 'list');
-      fetchHistory();
-    }
-
-    function hideHistoryItem(key, event) {
-      if (event) event.stopPropagation();
-      if (!hiddenHistoryKeys.includes(key)) {
-        hiddenHistoryKeys.push(key);
-        localStorage.setItem('minimax_hidden_history', JSON.stringify(hiddenHistoryKeys));
-      }
-      showToast("已隱藏該部影片紀錄", 1500);
-      fetchHistory();
-    }
-
-    function resetHiddenHistory() {
-      hiddenHistoryKeys = [];
-      localStorage.setItem('minimax_hidden_history', JSON.stringify([]));
-      showToast("已重置並顯示所有隱藏影片", 1500);
-      fetchHistory();
-    }
-
-    async function fetchHistory() {
-      try {
-        const res = await fetch('/api/history');
-        if (!res.ok) return [];
-        const items = await res.json();
-        const container = document.getElementById('history-container');
-        const badge = document.getElementById('history-count-badge');
-        const unhideBtn = document.getElementById('btn-unhide');
-        const hiddenCountEl = document.getElementById('hidden-count');
-
-        if (unhideBtn && hiddenCountEl) {
-          const hiddenCount = hiddenHistoryKeys.length;
-          hiddenCountEl.innerText = hiddenCount;
-          unhideBtn.style.display = hiddenCount > 0 ? 'inline-block' : 'none';
-        }
-
-        if (!items || items.length === 0) {
-          badge.innerText = '0 部影片';
-          container.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">目前尚無歷史紀錄。</p>';
-          return [];
-        }
-
-        const visibleItems = items.filter(item => {
-          const key = item.output_filename || item.output_path;
-          return !hiddenHistoryKeys.includes(key);
-        });
-
-        badge.innerText = `${visibleItems.length} 部影片`;
-
-        if (visibleItems.length === 0) {
-          container.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">所有歷史影片均已隱藏，點擊右上角可還原顯示。</p>';
-          return visibleItems;
-        }
-
-        if (historyViewMode === 'list') {
-          container.className = 'history-list-view';
-          container.innerHTML = visibleItems.map(item => {
-            const key = item.output_filename || item.output_path;
-            const videoSrc = item.output_path ? `/api/video-stream?path=${encodeURIComponent(item.output_path)}` : (item.output_filename ? `/outputs/${item.output_filename}` : '');
-            return `
-              <div class="history-list-row" onclick='loadHistoryItem(${JSON.stringify(item)})'>
-                <div style="display:flex; align-items:center; gap:0.75rem; min-width:0; flex:1;">
-                  <span style="font-size:1.2rem; color:#818cf8;">🎬</span>
-                  <div style="min-width:0; flex:1;">
-                    <div style="font-size:0.85rem; font-weight:600; color:var(--text-main); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-                      ${item.prompt}
-                    </div>
-                    <div style="font-size:0.7rem; color:var(--text-muted); font-family:'JetBrains Mono',monospace; display:flex; gap:0.5rem; margin-top:0.2rem;">
-                      <span>${item.output_filename || ''}</span>
-                      <span>•</span>
-                      <span>${item.width}x${item.height}</span>
-                      <span>•</span>
-                      <span>${item.duration_sec}s</span>
-                      ${item.execution_time_sec ? `<span>• ${(item.execution_time_sec/60).toFixed(1)}m</span>` : ''}
-                    </div>
-                  </div>
-                </div>
-                <div style="display:flex; gap:0.4rem; align-items:center;" onclick="event.stopPropagation();">
-                  <button class="btn-tiny" onclick='loadHistoryItem(${JSON.stringify(item)})' title="在播放器播放">▶️ 播放</button>
-                  <button class="btn-tiny" onclick="hideHistoryItem('${key}', event)" title="從列表中隱藏">✕ 隱藏</button>
-                </div>
-              </div>
-            `;
-          }).join('');
-        } else {
-          container.className = 'history-grid';
-          container.innerHTML = visibleItems.map(item => {
-            const key = item.output_filename || item.output_path;
-            const videoSrc = item.output_path ? `/api/video-stream?path=${encodeURIComponent(item.output_path)}` : (item.output_filename ? `/outputs/${item.output_filename}` : '');
-            return `
-              <div class="history-item" onclick='loadHistoryItem(${JSON.stringify(item)})'>
-                <button class="btn-hide-item" onclick="hideHistoryItem('${key}', event)" title="隱藏這部影片">✕</button>
-                <div class="history-video-thumb">
-                  ${videoSrc ? `<video src="${videoSrc}" preload="metadata" muted></video>` : '❌ Failed'}
-                </div>
-                <div class="history-prompt">${item.prompt}</div>
-                <div class="history-footer">
-                  <span>${item.width}x${item.height} (${item.duration_sec}s)</span>
-                  <span>${item.execution_time_sec ? (item.execution_time_sec/60).toFixed(1)+'m' : ''}</span>
-                </div>
-              </div>
-            `;
-          }).join('');
-        }
-        return visibleItems;
-      } catch (e) { return []; }
-    }
-
-    function loadHistoryItem(item) {
-      if (!item || (!item.output_path && !item.output_filename)) return;
-      displayResult(item);
+      document.getElementById('player-wrap').scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
 
     function displayResult(res) {
       currentResult = res;
       const player = document.getElementById('video-player');
       const empty = document.getElementById('empty-state');
-      const toolbar = document.getElementById('player-toolbar');
-
       empty.style.display = 'none';
       player.style.display = 'block';
-      toolbar.style.display = 'flex';
-
-      player.loop = (playMode === 'loop');
-      player.playbackRate = parseFloat(document.getElementById('play-speed').value) || 1.0;
-
       const videoUrl = res.output_path ? `/api/video-stream?path=${encodeURIComponent(res.output_path)}` : `/outputs/${res.output_filename}`;
-      if (player.src !== window.location.origin + videoUrl && player.getAttribute('src') !== videoUrl) {
-        player.src = videoUrl;
-        player.play().catch(()=>{});
-      }
+      player.src = videoUrl;
+      player.play().catch(()=>{});
 
       document.getElementById('meta-res').innerText = `${res.width}x${res.height}`;
-      document.getElementById('meta-dur').innerText = `${res.duration_sec}s (${res.frames}f)`;
+      document.getElementById('meta-dur').innerText = `${res.duration_sec || 2.0}s`;
       document.getElementById('meta-seed').innerText = res.seed;
-      document.getElementById('meta-steps').innerText = res.steps;
-      document.getElementById('meta-time').innerText = (res.execution_time_sec / 60).toFixed(1) + ' min';
-      document.getElementById('meta-mem').innerText = (res.peak_memory_gib || '27.0') + ' GB';
-
-      // Set default subtitle end time to match duration
-      if (res.duration_sec) {
-        document.getElementById('sub-end-sec').value = res.duration_sec;
-      }
-
+      document.getElementById('meta-time').innerText = res.execution_time_sec ? `${(res.execution_time_sec/60).toFixed(1)}m` : '--';
       document.getElementById('meta-grid').style.display = 'grid';
-      document.getElementById('action-row').style.display = 'flex';
-      document.getElementById('download-link').href = videoUrl;
     }
 
-    function showRunning(job) {
-      const genBtn = document.getElementById('btn-gen');
-      genBtn.disabled = true;
-      genBtn.style.opacity = '0.65';
-      genBtn.innerHTML = '<span>⏳ 任務生成中...</span>';
-
-      const addBtn = document.getElementById('btn-add-queue');
-      if (addBtn) {
-        addBtn.disabled = false;
-        addBtn.style.display = 'flex';
+    async function burnSubtitles() {
+      const text = document.getElementById('sub-text').value.trim();
+      if (!text || !currentResult || !currentResult.output_path) {
+        showToast('⚠️ 請先選擇影片並輸入字幕！');
+        return;
       }
-
-      const cancelBtn = document.getElementById('btn-cancel');
-      if (cancelBtn) {
-        cancelBtn.disabled = false;
-        cancelBtn.innerHTML = '<span>🛑 中止生成 (Cancel)</span>';
-      }
-
-      document.getElementById('progress-box').style.display = 'flex';
-      document.getElementById('stage-text').innerText = job.stage || 'Processing...';
-      const pct = Math.min(100, Math.max(5, (job.progress * 100)));
-      document.getElementById('progress-bar').style.width = pct + '%';
-      const pctEl = document.getElementById('stage-pct');
-      if (pctEl) pctEl.innerText = Math.floor(pct) + '%';
-      if (job.elapsed_sec) {
-        const m = Math.floor(job.elapsed_sec / 60);
-        const s = Math.floor(job.elapsed_sec % 60);
-        document.getElementById('time-text').innerText = m > 0 ? `${m}m ${s}s` : `${s}s`;
-      } else {
-        document.getElementById('time-text').innerText = '0s';
-      }
-    }
-
-    function showIdle() {
-      const genBtn = document.getElementById('btn-gen');
-      genBtn.disabled = false;
-      genBtn.style.opacity = '1.0';
-      genBtn.innerHTML = '<span>🚀 立即生成 (Generate)</span>';
-
-      const addBtn = document.getElementById('btn-add-queue');
-      if (addBtn) {
-        addBtn.disabled = false;
-        addBtn.style.display = 'flex';
-      }
-
-      document.getElementById('progress-box').style.display = 'none';
-    }
-
-    async function handleGenerateClick() {
-      const fullText = document.getElementById('prompt').value.trim();
-      if (!fullText) { showToast("請輸入提示詞 (Prompt)"); return; }
-
-      const lines = fullText.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-      const profile = document.getElementById('profile').value;
-      const width = parseInt(document.getElementById('width').value, 10) || 768;
-      const height = parseInt(document.getElementById('height').value, 10) || 448;
-      const duration_sec = parseFloat(document.getElementById('duration-num').value) || 2.0;
-      const steps = parseInt(document.getElementById('steps').value, 10) || 10;
-      const seed = parseInt(document.getElementById('seed').value, 10);
-      const output_dir = document.getElementById('output-dir').value.trim();
-
-      // If user provided multiple lines in the prompt box, immediately run the first one and queue the rest!
-      if (lines.length > 1) {
-        const restLines = lines.slice(1).join('\\n');
-        try {
-          await fetch('/api/queue/batch-add', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ prompts_text: restLines, profile, width, height, duration_sec, steps, seed, output_dir })
-          });
-          fetchQueue();
-        } catch (e) {}
-      }
-
-      const promptToRun = lines[0];
+      showToast('⏳ 正在進行秒級字幕壓制...');
       try {
-        const res = await fetch('/api/generate', {
+        const res = await fetch('/api/subtitles/burn', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ prompt: promptToRun, profile, width, height, duration_sec, steps, seed, output_dir })
+          body: JSON.stringify({
+            video_path: currentResult.output_path,
+            text: text,
+            style: document.getElementById('sub-style').value,
+            position: document.getElementById('sub-pos').value,
+          })
         });
-        if (!res.ok) {
-          const err = await res.json();
-          showToast("啟動失敗: " + (err.detail || "未知錯誤"));
-          return;
-        }
-        lastToastError = null;
-        showRunning({stage: 'Starting generation...', progress: 0.05, elapsed_sec: 0});
-        syncJobState();
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '字幕壓制失敗');
+        showToast('✅ 字幕壓制完成！已儲存新影片！');
+        displayResult(data);
+        await fetchHistory();
       } catch (e) {
-        showToast("⚠️ 無法連接到本地伺服器，請確認服務已啟動。");
-        showIdle();
+        showToast(`❌ ${e.message}`);
       }
     }
 
-    async function openOutputFolder() {
-      if (currentResult && currentResult.output_path) {
-        await fetch('/api/open-folder', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({file_path: currentResult.output_path})
-        });
-      } else {
-        const dir = document.getElementById('output-dir').value.trim();
-        await fetch('/api/open-folder', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({dir_path: dir})
-        });
-      }
-    }
-
-    function copyFilePath() {
-      if (currentResult && currentResult.output_path) {
-        navigator.clipboard.writeText(currentResult.output_path);
-        showToast("已複製檔案路徑至剪貼簿！", 2500);
-      }
-    }
-
-    // Initialize on page load
-    async function initApp() {
-      updateDurationDisplay(2.0);
-      setHistoryView(historyViewMode);
-      await fetchStatus();
-      await fetchQueue();
-      await syncJobState();
-      const historyList = await fetchHistory();
-      if (!currentResult && historyList && historyList.length > 0) {
-        const validItem = historyList.find(i => i.file_exists || (i.output_path && i.output_path.length > 0) || i.output_filename);
-        if (validItem) {
-          displayResult(validItem);
+    async function fetchHistory() {
+      try {
+        const res = await fetch('/api/history');
+        const items = await res.json();
+        document.getElementById('history-count-badge').innerText = `${items.length} 部`;
+        const container = document.getElementById('history-container');
+        if (!items || items.length === 0) {
+          container.innerHTML = `<span style="font-size:0.75rem; color:var(--text-muted);">尚無歷史紀錄。</span>`;
+          return items;
         }
+        container.innerHTML = items.map(item => `
+          <div class="queue-card" onclick='displayResult(${JSON.stringify(item)})' style="cursor:pointer;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-size:0.75rem; color:#818cf8; font-weight:700;">${item.output_filename}</span>
+              <button class="btn-tiny" onclick="event.stopPropagation(); openOutputFolder('${item.output_path}')">📂 Finder</button>
+            </div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">${item.prompt}</div>
+          </div>
+        `).join('');
+        return items;
+      } catch (e) { return []; }
+    }
+
+    function setHistoryView(mode) {
+      historyViewMode = mode;
+      localStorage.setItem('minimax_history_view', mode);
+      fetchHistory();
+    }
+
+    function openOutputFolder(p) {
+      fetch('/api/open-folder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({file_path: p})
+      });
+    }
+
+    // Reactive State Sync Loop
+    async function syncJobState() {
+      try {
+        const res = await fetch('/api/job');
+        const data = await res.json();
+        const pCard = document.getElementById('progress-card');
+        const pFill = document.getElementById('progress-fill');
+        const pStage = document.getElementById('progress-stage-text');
+        const pPct = document.getElementById('progress-pct-text');
+        const stateText = document.getElementById('system-state-text');
+
+        if (data.is_running) {
+          pCard.style.display = 'flex';
+          pFill.style.width = `${Math.round(data.progress * 100)}%`;
+          pStage.innerText = data.stage || '生成中...';
+          pPct.innerText = `${Math.round(data.progress * 100)}%`;
+          stateText.innerText = (data.job_type === 'IMAGE' ? '🎨 圖片生成中' : '🎬 影片去噪中');
+        } else {
+          pCard.style.display = 'none';
+          stateText.innerText = 'Ready';
+        }
+      } catch (e) {}
+    }
+
+    async function syncStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        if (data.memory) {
+          document.getElementById('mem-used').innerText = `${data.memory.used_gib} GB`;
+          document.getElementById('mem-total').innerText = `${data.memory.total_gib} GB`;
+        }
+      } catch (e) {}
+    }
+
+    // Init
+    async function initApp() {
+      await syncStatus();
+      await syncJobState();
+      await fetchQueue();
+      await fetchImageHistory();
+      const historyItems = await fetchHistory();
+      if (historyItems && historyItems.length > 0 && !currentResult) {
+        displayResult(historyItems[0]);
       }
       setInterval(syncJobState, 1500);
       setInterval(fetchQueue, 2500);
-      setInterval(fetchStatus, 4000);
+      setInterval(syncStatus, 4000);
     }
 
     window.addEventListener('DOMContentLoaded', initApp);
@@ -1899,30 +1708,11 @@ INDEX_HTML = """<!DOCTYPE html>
 
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    return INDEX_HTML
-
-
-def start_server(port: int | None = None, open_browser: bool = True):
-    actual_port = port or 7860
-    url = f"http://127.0.0.1:{actual_port}"
-
-    print("\n" + "=" * 60)
-    print("🎬 MiniMax-H3 Local Web Studio (with Prompt Queue & Subtitle Editor)")
-    print(f"URL: {url}")
-    print("=" * 60 + "\n", flush=True)
-
-    if open_browser:
-        def _open():
-            time.sleep(1.0)
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
-        threading.Thread(target=_open, daemon=True).start()
-
-    uvicorn.run(app, host="127.0.0.1", port=actual_port, log_level="info")
+async def index():
+    return HTMLResponse(INDEX_HTML)
 
 
 if __name__ == "__main__":
-    start_server()
+    port = 7860
+    print(f"🎬 啟動 色色 Studio (http://127.0.0.1:{port}/)")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
