@@ -121,24 +121,28 @@ def get_image_history(limit: int = 40) -> list[dict]:
 
 # Registry of available image generation models
 IMAGE_MODELS: dict[str, dict[str, Any]] = {
-    "krea-2": {
-        "id": "krea-2",
-        "display_name": "Krea 2 Turbo — Quality",
+    "fhdr-uncensored": {
+        "id": "fhdr-uncensored",
+        "display_name": "FHDR Uncensored — Quality",
+        "repo_id": "PocketAiHub/FHDR-Uncensored-MFLUX",
         "backend": "mlx_mflux",
         "supports_t2i": True,
         "supports_i2i": True,
-        "supports_multi_reference": True,
+        "supports_multi_reference": False,
         "supported_quantization": [4, 8],
         "recommended_profiles": ["draft", "balanced", "high", "maximum"],
         "default_profile": "high",
-        "memory_requirement": "~8-12 GB",
+        "memory_requirement": "~10-14 GB (Q4) / ~18-22 GB (Q8)",
+        "license": "FLUX.1-dev Non-Commercial License Derivative",
         "is_default": True,
-        "description": "高品質專用模型，細節細膩、光影層次豐富",
+        "description": "高品質無閹割寫實模型，創作自由度高、真實光影與細節豐富",
+        "is_gated": True,
         "available": True,
     },
     "flux2-klein-4b": {
         "id": "flux2-klein-4b",
         "display_name": "FLUX.2 Klein 4B — Fast",
+        "repo_id": "black-forest-labs/FLUX.2-Klein-4B",
         "backend": "mlx_mflux",
         "supports_t2i": True,
         "supports_i2i": True,
@@ -147,18 +151,52 @@ IMAGE_MODELS: dict[str, dict[str, Any]] = {
         "recommended_profiles": ["draft", "balanced", "high", "maximum"],
         "default_profile": "high",
         "memory_requirement": "~3-5 GB",
+        "license": "Apache 2.0 / Open Weights",
         "is_default": False,
-        "description": "極速備用模型，4步快速構圖",
+        "description": "極速備用模型，4步快速構圖，開源免授權",
+        "is_gated": False,
         "available": True,
     },
 }
 
 
+def check_hf_token_available() -> bool:
+    """Check if Hugging Face token is present in env or local cache."""
+    token_path = Path.home() / ".cache" / "huggingface" / "token"
+    token_path_alt = Path.home() / ".huggingface" / "token"
+    return bool(
+        os.environ.get("HF_TOKEN")
+        or (token_path.exists() and token_path.read_text().strip())
+        or (token_path_alt.exists() and token_path_alt.read_text().strip())
+    )
+
+
+def save_hf_token(token: str) -> None:
+    """Save Hugging Face token to local user cache."""
+    t = token.strip()
+    if not t:
+        raise ValueError("Token cannot be empty")
+    token_dir = Path.home() / ".cache" / "huggingface"
+    token_dir.mkdir(parents=True, exist_ok=True)
+    (token_dir / "token").write_text(t, encoding="utf-8")
+    os.environ["HF_TOKEN"] = t
+
+
 def get_available_image_models() -> dict[str, Any]:
     """Retrieve available image models, capabilities, and default selection."""
+    has_token = check_hf_token_available()
+    models = []
+    for m in IMAGE_MODELS.values():
+        item = dict(m)
+        if item.get("is_gated") and not has_token:
+            item["auth_status"] = "needs_token"
+        else:
+            item["auth_status"] = "ready"
+        models.append(item)
     return {
-        "default_model": "krea-2",
-        "models": list(IMAGE_MODELS.values()),
+        "default_model": "fhdr-uncensored",
+        "has_hf_token": has_token,
+        "models": models,
     }
 
 
@@ -175,7 +213,7 @@ class ResolvedImageConfig:
 
 
 def resolve_image_profile(
-    model_name: str = "krea-2",
+    model_name: str = "fhdr-uncensored",
     quality_profile: str = "high",
     width: int = 768,
     height: int = 768,
@@ -183,7 +221,7 @@ def resolve_image_profile(
     custom_quantize: int | None = None,
 ) -> ResolvedImageConfig:
     """Resolve model-specific inference parameters for Draft/Balanced/High/Maximum."""
-    model_key = "krea-2" if "krea" in str(model_name).lower() else "flux2-klein-4b"
+    model_key = "flux2-klein-4b" if "klein" in str(model_name).lower() else "fhdr-uncensored"
     qp = (quality_profile or "high").lower()
 
     if qp == "custom":
@@ -191,54 +229,54 @@ def resolve_image_profile(
         h = (height // 16) * 16
         return ResolvedImageConfig(
             model_name=model_key,
-            steps=custom_steps if custom_steps and custom_steps > 0 else (8 if model_key == "krea-2" else 4),
+            steps=custom_steps if custom_steps and custom_steps > 0 else (30 if model_key == "fhdr-uncensored" else 4),
             quantize=custom_quantize if custom_quantize in [4, 8] else 4,
             width=max(256, min(1536, w)),
             height=max(256, min(1536, h)),
-            guidance=1.0,
+            guidance=4.0 if model_key == "fhdr-uncensored" else 1.0,
             quality_profile="custom",
         )
 
-    if model_key == "krea-2":
+    if model_key == "fhdr-uncensored":
         if qp == "draft":
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=4,
+                steps=10,
                 quantize=4,
                 width=512,
                 height=512,
-                guidance=1.0,
+                guidance=3.5,
                 quality_profile="draft",
             )
         elif qp == "balanced":
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=6,
+                steps=20,
                 quantize=4,
                 width=768,
                 height=768,
-                guidance=1.0,
+                guidance=4.0,
                 quality_profile="balanced",
             )
         elif qp == "maximum":
-            # Maximum on Krea 2: 12 steps, 8-bit precision, 1024x1024
+            # Maximum on FHDR: 40 steps, 8-bit precision (8bit branch), Guidance 4.5
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=12,
+                steps=40,
                 quantize=8,
                 width=1024,
                 height=1024,
-                guidance=1.0,
+                guidance=4.5,
                 quality_profile="maximum",
             )
         else:  # "high" (Default)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=8,
+                steps=30,
                 quantize=4,
                 width=1024,
                 height=1024,
-                guidance=1.0,
+                guidance=4.0,
                 quality_profile="high",
             )
     else:  # FLUX.2 Klein 4B
@@ -299,7 +337,7 @@ def generate_images(
     height: int = 768,
     steps: int = 4,
     seed: int = -1,
-    model_name: str = "krea-2",
+    model_name: str = "fhdr-uncensored",
     quality_profile: str = "high",
     quantize: int = 4,
     count: int = 1,
@@ -307,7 +345,7 @@ def generate_images(
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> list[ImageResult]:
-    """Generate 1 to 4 images sequentially using Krea 2 Turbo / FLUX.2 Klein on Apple Silicon."""
+    """Generate 1 to 4 images sequentially using FHDR Uncensored / FLUX.2 Klein on Apple Silicon."""
     global _RESIDENT_FLUX_MODEL, _RESIDENT_MODEL_NAME
 
     if not prompt or not prompt.strip():
@@ -330,6 +368,7 @@ def generate_images(
     eff_height = cfg.height
     eff_steps = cfg.steps
     eff_quantize = cfg.quantize
+    eff_guidance = cfg.guidance
     eff_model = cfg.model_name
     eff_profile = cfg.quality_profile
 
@@ -358,11 +397,20 @@ def generate_images(
                 except Exception:
                     pass
 
-            if eff_model == "krea-2":
-                from mflux.models.krea2.variants.txt2img.krea2 import Krea2
+            if eff_model == "fhdr-uncensored":
+                # Verify Hugging Face access for gated repo
+                if not check_hf_token_available():
+                    raise RuntimeError(
+                        "載入 PocketAiHub/FHDR-Uncensored-MFLUX 需要 Hugging Face Access Token 授權。\n"
+                        "請至 https://huggingface.co/settings/tokens 取得 Token 並在設定中填入，或切換至 FLUX.2 Klein 4B 繼續生成。"
+                    )
+                from mflux.models.flux.variants.txt2img.flux import Flux1
                 from mflux.models.common.config.model_config import ModelConfig
-                krea_cfg = ModelConfig.krea2()
-                _RESIDENT_FLUX_MODEL = Krea2(quantize=eff_quantize, model_config=krea_cfg)
+                _RESIDENT_FLUX_MODEL = Flux1(
+                    model_path="PocketAiHub/FHDR-Uncensored-MFLUX",
+                    quantize=eff_quantize,
+                    model_config=ModelConfig.dev(),
+                )
             else:  # flux2-klein-4b
                 from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
                 from mflux.models.common.config.model_config import ModelConfig
@@ -392,13 +440,23 @@ def generate_images(
         out_path = target_dir / filename
 
         try:
-            generated_img = _RESIDENT_FLUX_MODEL.generate_image(
-                seed=current_seed,
-                prompt=prompt.strip(),
-                num_inference_steps=eff_steps,
-                height=eff_height,
-                width=eff_width,
-            )
+            if eff_model == "fhdr-uncensored":
+                generated_img = _RESIDENT_FLUX_MODEL.generate_image(
+                    seed=current_seed,
+                    prompt=prompt.strip(),
+                    num_inference_steps=eff_steps,
+                    height=eff_height,
+                    width=eff_width,
+                    guidance=eff_guidance,
+                )
+            else:
+                generated_img = _RESIDENT_FLUX_MODEL.generate_image(
+                    seed=current_seed,
+                    prompt=prompt.strip(),
+                    num_inference_steps=eff_steps,
+                    height=eff_height,
+                    width=eff_width,
+                )
 
             # Save PIL image
             generated_img.image.save(str(out_path), "PNG")
@@ -417,6 +475,7 @@ def generate_images(
                     "model": eff_model,
                     "quality_profile": eff_profile,
                     "quantize": eff_quantize,
+                    "guidance": eff_guidance,
                 },
                 prompt=prompt.strip(),
             )

@@ -56,23 +56,27 @@
 
 ```python
 IMAGE_MODELS = {
-    "krea-2": {
-        "id": "krea-2",
-        "display_name": "Krea 2 Turbo — Quality",
+    "fhdr-uncensored": {
+        "id": "fhdr-uncensored",
+        "display_name": "FHDR Uncensored — Quality",
+        "repo_id": "PocketAiHub/FHDR-Uncensored-MFLUX",
         "backend": "mlx_mflux",
         "supports_t2i": True,
         "supports_i2i": True,
-        "supports_multi_reference": True,
+        "supports_multi_reference": False,
         "supported_quantization": [4, 8],
         "recommended_profiles": ["draft", "balanced", "high", "maximum"],
         "default_profile": "high",
-        "memory_requirement": "~8-12 GB",
+        "memory_requirement": "~10-14 GB (Q4) / ~18-22 GB (Q8)",
+        "license": "FLUX.1-dev Non-Commercial License Derivative",
         "is_default": True,
-        "description": "高品質專用模型，細節細膩、光影層次豐富",
+        "description": "高品質無閹割寫實模型，創作自由度高、真實光影與細節豐富",
+        "is_gated": True,
     },
     "flux2-klein-4b": {
         "id": "flux2-klein-4b",
         "display_name": "FLUX.2 Klein 4B — Fast",
+        "repo_id": "black-forest-labs/FLUX.2-Klein-4B",
         "backend": "mlx_mflux",
         "supports_t2i": True,
         "supports_i2i": True,
@@ -81,8 +85,10 @@ IMAGE_MODELS = {
         "recommended_profiles": ["draft", "balanced", "high", "maximum"],
         "default_profile": "high",
         "memory_requirement": "~3-5 GB",
+        "license": "Apache 2.0 / Open Weights",
         "is_default": False,
-        "description": "極速備用模型，4步快速構圖",
+        "description": "極速備用模型，4步快速構圖，開源免授權",
+        "is_gated": False,
     },
 }
 ```
@@ -91,12 +97,12 @@ IMAGE_MODELS = {
 
 提供 `Draft / Balanced / High / Maximum` 4 級品質設定，針對模型特性自適應最佳參數：
 
-* **Krea 2 Turbo**：
-  * `draft`：4 steps, 4-bit, 512×512, Guidance 1.0 (極速構圖)
-  * `balanced`：6 steps, 4-bit, 768×768, Guidance 1.0 (效率平衡)
-  * `high` (Default)：8 steps, 4-bit, 1024×1024, Guidance 1.0 (高品質正式產出)
-  * `maximum`：12 steps, 8-bit, 1024×1024, Guidance 1.0 (極致畫質，精度優先)
-* **FLUX.2 Klein 4B**：
+* **FHDR Uncensored (`fhdr-uncensored`)**：
+  * `draft`：10 steps, Guidance 3.5, 4-bit, 512×512 (極速構圖)
+  * `balanced`：20 steps, Guidance 4.0, 4-bit, 768×768 (效率與品質平衡)
+  * `high` (Default)：30 steps, Guidance 4.0, 4-bit, 1024×1024 (高品質正式輸出)
+  * `maximum`：40 steps, Guidance 4.5, 8-bit, 1024×1024 (極致精度 Q8，細膩光影)
+* **FLUX.2 Klein 4B (`flux2-klein-4b`)**：
   * `draft`：2 steps, 4-bit, 512×512
   * `balanced`：4 steps, 4-bit, 768×768
   * `high` (Default)：4 steps, 4-bit, 1024×1024
@@ -111,7 +117,7 @@ def generate_images(
     height: int = 768,
     steps: int = 4,
     seed: int = -1,
-    model_name: str = "krea-2",
+    model_name: str = "fhdr-uncensored",
     quality_profile: str = "high",
     quantize: int = 4,
     count: int = 1,
@@ -138,7 +144,7 @@ def generate_images(
 | `height` | `int` | 圖片高度（自動對齊 16 的倍數） | `768` |
 | `steps` | `int` | 採樣步數 (Inference Steps，相容舊介面) | `4` |
 | `seed` | `int` | 隨機種子（`-1` 代表隨機） | `-1` |
-| `model_name` | `str` | 模型識別名稱 (`"krea-2"` / `"flux2-klein-4b"`) | `"krea-2"` |
+| `model_name` | `str` | 模型識別名稱 (`"fhdr-uncensored"` / `"flux2-klein-4b"`) | `"fhdr-uncensored"` |
 | `quality_profile`| `str` | 品質檔位 (`"draft"` / `"balanced"` / `"high"` / `"maximum"`) | `"high"` |
 | `quantize` | `int` | MLX 量化位元 (4 或 8) | `4` |
 | `count` | `int` | 生成張數 (1 ~ 4，循序生成避免 OOM) | `1` |
