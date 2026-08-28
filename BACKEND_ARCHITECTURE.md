@@ -95,21 +95,19 @@ IMAGE_MODELS = {
 
 ### 2. 非線性品質設定檔解析器：`resolve_image_profile(...)`
 
-提供 `Draft / Balanced / High / Maximum` 4 級品質設定，解析度採用 **Resolution Class** 機制（保留使用者設定之長寬比 Aspect Ratio，並對齊至 16 倍數）：
+提供 `Draft / Balanced / High / Maximum` 4 級品質設定，搭配 **`🔥 極限品質模式 (Extreme Quality Mode: OFF/ON)`**，解析度採用 **Resolution Class** 機制（保留使用者設定之長寬比 Aspect Ratio，並對齊至 16 倍數）：
 
-* **FHDR Uncensored (`fhdr-uncensored`)**：
-  * **`Draft`**：Q4 / 12 steps / 512-class / Guidance 4.0 (極速構圖)
-  * **`Balanced`**：Q4 / 24 steps / 768-class / Guidance 4.0 (效率與品質平衡)
-  * **`High` (Default)**：Q4 / 40 steps / 1024-class / Guidance 4.0 (高品質正式產出)
-  * **`Maximum`**：Guidance 4.0，參數不預先寫死，由 M1 32GB 實機 Benchmark 評估 3 組候選後採用最佳者：
-    1. `Q8 / 40 steps / 1024-class`
-    2. `Q4 / 40 steps / 更高 Resolution Class (~1280-class)`
-    3. `Q4 / 48 steps / 1024-class`
-* **FLUX.2 Klein 4B (`flux2-klein-4b`)**：
-  * **`Draft`**：Q4 / 2 steps / 512-class
-  * **`Balanced`**：Q4 / 4 steps / 768-class
-  * **`High` (Default)**：Q4 / 4 steps / 1024-class
-  * **`Maximum`**：Q4 / 8 steps / 1024-class
+#### 🎯 Maximum 與極限品質模式的本質差異：
+* **`Maximum` (極限模式 OFF)**：經 M1 32GB 實測驗證，**可穩定日常連續使用的最高品質設定**。
+* **`🔥 極限品質模式` (極限模式 ON)**：偶爾使用的實驗性最高畫質模式，**畫質優先於時間**，允許顯著拉長生成時間與提高 RAM / Swap 水位，榨出硬體極限（但不引發 Jetsam / OOM）。
+
+#### 📊 FHDR Uncensored 參數映射矩陣：
+| Profile 檔位 | 標準模式 (Extreme OFF) | 🔥 極限品質模式 (Extreme ON) |
+| :--- | :--- | :--- |
+| **`Draft`** | Q4 / 12 steps / 512-class / Guidance 4.0 | Q4 / 16 steps / 640-class / Guidance 4.0 |
+| **`Balanced`** | Q4 / 24 steps / 768-class / Guidance 4.0 | Q4 / 32 steps / 896-class / Guidance 4.0 |
+| **`High` (預設)** | Q4 / 40 steps / 1024-class / Guidance 4.0 | Q8 / 40 steps / 1024-class / Guidance 4.0 |
+| **`Maximum`** | Q4 / 40 steps / 1024-class (日常穩定頂級) | Q8 / 48 steps / 1152-class (不計耗時極限畫質) |
 
 ### 3. 核心生成函式：`generate_images(...)`
 
@@ -122,6 +120,7 @@ def generate_images(
     seed: int = -1,
     model_name: str = "fhdr-uncensored",
     quality_profile: str = "high",
+    extreme_quality_mode: bool = False,
     quantize: int = 4,
     count: int = 1,
     output_dir: str | Path | None = None,
@@ -130,11 +129,11 @@ def generate_images(
 ) -> list[ImageResult]:
     """
     【標準介面契約】
-    1. 接收前端傳入之標準參數與 quality_profile。
+    1. 接收前端傳入之標準參數、quality_profile 與 extreme_quality_mode。
     2. 自動確保顯存安全：呼叫 model_manager.switch_to_engine("IMAGE")。
     3. 執行圖片生成邏輯（本地模型、外部 API 或 ComfyUI）。
     4. 將圖片寫入指定之 output_dir（預設 outputs/images/）。
-    5. 自動呼叫 register_asset(...) 登記至資產庫。
+    5. 自動呼叫 register_asset(...) 登記至資產庫（含實際執行之 steps, precision, resolution 等 Metadata）。
     6. 回傳標準 ImageResult 物件清單。
     """
 ```

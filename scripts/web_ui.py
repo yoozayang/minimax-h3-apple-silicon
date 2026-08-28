@@ -136,6 +136,7 @@ class ImageGenerateRequest(BaseModel):
     seed: int = -1
     model_name: str = "fhdr-uncensored"
     quality_profile: str = "high"
+    extreme_quality_mode: bool = False
     quantize: int = 4
     count: int = 1
     output_dir: str | None = None
@@ -524,6 +525,7 @@ async def generate_image_endpoint(req: ImageGenerateRequest):
             seed=req.seed,
             model_name=req.model_name,
             quality_profile=req.quality_profile,
+            extreme_quality_mode=req.extreme_quality_mode,
             quantize=req.quantize,
             count=req.count,
             output_dir=req.output_dir,
@@ -1264,7 +1266,7 @@ INDEX_HTML = """<!DOCTYPE html>
                 <option value="flux2-klein-4b">⚡ FLUX.2 Klein 4B — Fast</option>
               </select>
             </div>
-            <div style="display:flex; align-items:center; gap:0.4rem; flex:1; min-width:220px;">
+            <div style="display:flex; align-items:center; gap:0.4rem; flex:1; min-width:200px;">
               <span style="font-size:0.75rem; font-weight:700; color:#a5b4fc;">品質:</span>
               <div class="chips-container" id="img-quality-selector" style="display:flex; gap:0.25rem; flex:1;">
                 <span class="chip" id="qchip-draft" onclick="setImageQuality('draft')">Draft</span>
@@ -1272,6 +1274,9 @@ INDEX_HTML = """<!DOCTYPE html>
                 <span class="chip active" id="qchip-high" onclick="setImageQuality('high')">High</span>
                 <span class="chip" id="qchip-maximum" onclick="setImageQuality('maximum')">Maximum</span>
               </div>
+            </div>
+            <div style="display:flex; align-items:center; gap:0.3rem;">
+              <button id="btn-extreme-quality" class="btn-tiny" style="background:rgba(239,68,68,0.08); border-color:rgba(239,68,68,0.3); color:#fca5a5; font-weight:700; padding:0.25rem 0.55rem; border-radius:6px; cursor:pointer; transition:0.2s;" onclick="toggleExtremeQuality()" title="🔥 極限品質模式：不計耗時追求最高畫質（預設關閉）">🔥 極限品質: OFF</button>
             </div>
           </div>
 
@@ -1747,6 +1752,28 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
+    let extremeQualityMode = false;
+
+    function toggleExtremeQuality() {
+      extremeQualityMode = !extremeQualityMode;
+      const btn = document.getElementById('btn-extreme-quality');
+      if (btn) {
+        if (extremeQualityMode) {
+          btn.innerText = '🔥 極限品質: ON';
+          btn.style.background = 'linear-gradient(135deg, rgba(239,68,68,0.3) 0%, rgba(245,158,11,0.3) 100%)';
+          btn.style.borderColor = '#ef4444';
+          btn.style.color = '#fff';
+          showToast('🔥 已開啟極限品質模式（不計生成時間，榨出最高畫質）');
+        } else {
+          btn.innerText = '🔥 極限品質: OFF';
+          btn.style.background = 'rgba(239,68,68,0.08)';
+          btn.style.borderColor = 'rgba(239,68,68,0.3)';
+          btn.style.color = '#fca5a5';
+          showToast('已關閉極限品質模式（恢復標準日常品質）');
+        }
+      }
+    }
+
     async function handleGenerateImageClick() {
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) {
@@ -1755,7 +1782,8 @@ INDEX_HTML = """<!DOCTYPE html>
       }
       const model_name = document.getElementById('image-model-select')?.value || 'fhdr-uncensored';
       const output_dir = (document.getElementById('output-dir')?.value || '').trim();
-      showToast(`🎨 開始使用 ${model_name.toUpperCase()} (${currentImageQuality.toUpperCase()}) 生成圖片...`);
+      const modeText = extremeQualityMode ? `${currentImageQuality.toUpperCase()} · 🔥極限` : currentImageQuality.toUpperCase();
+      showToast(`🎨 開始使用 ${model_name.toUpperCase()} (${modeText}) 生成圖片...`);
       try {
         const res = await fetch('/api/image/generate', {
           method: 'POST',
@@ -1764,6 +1792,7 @@ INDEX_HTML = """<!DOCTYPE html>
             prompt: prompt,
             model_name: model_name,
             quality_profile: currentImageQuality,
+            extreme_quality_mode: extremeQualityMode,
             width: parseInt(document.getElementById('custom-w')?.value || 768),
             height: parseInt(document.getElementById('custom-h')?.value || 768),
             steps: parseInt(document.getElementById('custom-steps')?.value || 4),

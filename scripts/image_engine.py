@@ -225,6 +225,7 @@ class ResolvedImageConfig:
     guidance: float
     scheduler: str | None = None
     quality_profile: str = "high"
+    extreme_quality_mode: bool = False
 
 
 def resolve_image_profile(
@@ -234,10 +235,12 @@ def resolve_image_profile(
     height: int = 768,
     custom_steps: int | None = None,
     custom_quantize: int | None = None,
+    extreme_quality_mode: bool = False,
 ) -> ResolvedImageConfig:
-    """Resolve model-specific inference parameters for Draft/Balanced/High/Maximum preserving aspect ratio."""
+    """Resolve model-specific inference parameters for Draft/Balanced/High/Maximum + Extreme Mode."""
     model_key = "flux2-klein-4b" if "klein" in str(model_name).lower() else "fhdr-uncensored"
     qp = (quality_profile or "high").lower()
+    extreme = bool(extreme_quality_mode)
 
     if qp == "custom":
         w = max(256, min(1536, (width // 16) * 16))
@@ -245,106 +248,131 @@ def resolve_image_profile(
         return ResolvedImageConfig(
             model_name=model_key,
             steps=custom_steps if custom_steps and custom_steps > 0 else (40 if model_key == "fhdr-uncensored" else 4),
-            quantize=custom_quantize if custom_quantize in [4, 8] else 4,
+            quantize=custom_quantize if custom_quantize in [4, 8] else (8 if extreme else 4),
             width=w,
             height=h,
             guidance=4.0 if model_key == "fhdr-uncensored" else 1.0,
             quality_profile="custom",
+            extreme_quality_mode=extreme,
         )
 
     if model_key == "fhdr-uncensored":
         if qp == "draft":
-            # Draft: Q4 / 12 steps / 512-class / Guidance 4.0
-            w, h = _calculate_resolution_by_class(512, width, height)
+            # Draft: Standard = Q4 / 12 steps / 512-class | Extreme = Q4 / 16 steps / 640-class
+            target_class = 640 if extreme else 512
+            steps = 16 if extreme else 12
+            w, h = _calculate_resolution_by_class(target_class, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=12,
+                steps=steps,
                 quantize=4,
                 width=w,
                 height=h,
                 guidance=4.0,
                 quality_profile="draft",
+                extreme_quality_mode=extreme,
             )
         elif qp == "balanced":
-            # Balanced: Q4 / 24 steps / 768-class / Guidance 4.0
-            w, h = _calculate_resolution_by_class(768, width, height)
+            # Balanced: Standard = Q4 / 24 steps / 768-class | Extreme = Q4 / 32 steps / 896-class
+            target_class = 896 if extreme else 768
+            steps = 32 if extreme else 24
+            w, h = _calculate_resolution_by_class(target_class, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=24,
+                steps=steps,
                 quantize=4,
                 width=w,
                 height=h,
                 guidance=4.0,
                 quality_profile="balanced",
+                extreme_quality_mode=extreme,
             )
         elif qp == "maximum":
-            # Maximum: 1024-class, Guidance 4.0 (to be finalized based on benchmark between Q8/40, Q4/48, Q4/Higher Res)
-            w, h = _calculate_resolution_by_class(1024, width, height)
+            # Maximum: Standard = Q4 / 40 steps / 1024-class (stable daily peak)
+            # Maximum: Extreme ON = Q8 / 48 steps / 1152-class (uncompromising quality)
+            target_class = 1152 if extreme else 1024
+            steps = 48 if extreme else 40
+            quantize = 8 if extreme else 4
+            w, h = _calculate_resolution_by_class(target_class, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=40,
-                quantize=8,
+                steps=steps,
+                quantize=quantize,
                 width=w,
                 height=h,
                 guidance=4.0,
                 quality_profile="maximum",
+                extreme_quality_mode=extreme,
             )
         else:  # "high" (Default)
-            # High: Q4 / 40 steps / 1024-class / Guidance 4.0
-            w, h = _calculate_resolution_by_class(1024, width, height)
+            # High: Standard = Q4 / 40 steps / 1024-class
+            # High: Extreme ON = Q8 / 40 steps / 1024-class
+            target_class = 1024
+            steps = 40
+            quantize = 8 if extreme else 4
+            w, h = _calculate_resolution_by_class(target_class, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=40,
-                quantize=4,
+                steps=steps,
+                quantize=quantize,
                 width=w,
                 height=h,
                 guidance=4.0,
                 quality_profile="high",
+                extreme_quality_mode=extreme,
             )
     else:  # FLUX.2 Klein 4B
         if qp == "draft":
-            w, h = _calculate_resolution_by_class(512, width, height)
+            target_class = 640 if extreme else 512
+            w, h = _calculate_resolution_by_class(target_class, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=2,
+                steps=4 if extreme else 2,
                 quantize=4,
                 width=w,
                 height=h,
                 guidance=1.0,
                 quality_profile="draft",
+                extreme_quality_mode=extreme,
             )
         elif qp == "balanced":
-            w, h = _calculate_resolution_by_class(768, width, height)
+            target_class = 896 if extreme else 768
+            w, h = _calculate_resolution_by_class(target_class, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=4,
+                steps=6 if extreme else 4,
                 quantize=4,
                 width=w,
                 height=h,
                 guidance=1.0,
                 quality_profile="balanced",
+                extreme_quality_mode=extreme,
             )
         elif qp == "maximum":
-            w, h = _calculate_resolution_by_class(1024, width, height)
+            target_class = 1152 if extreme else 1024
+            w, h = _calculate_resolution_by_class(target_class, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=8,
-                quantize=4,
+                steps=12 if extreme else 8,
+                quantize=8 if extreme else 4,
                 width=w,
                 height=h,
                 guidance=1.0,
                 quality_profile="maximum",
+                extreme_quality_mode=extreme,
             )
         else:  # "high" (Default)
-            w, h = _calculate_resolution_by_class(1024, width, height)
+            target_class = 1024
+            w, h = _calculate_resolution_by_class(target_class, width, height)
             return ResolvedImageConfig(
                 model_name=model_key,
-                steps=4,
-                quantize=4,
+                steps=8 if extreme else 4,
+                quantize=8 if extreme else 4,
                 width=w,
                 height=h,
                 guidance=1.0,
                 quality_profile="high",
+                extreme_quality_mode=extreme,
             )
 
 
@@ -365,6 +393,7 @@ def generate_images(
     seed: int = -1,
     model_name: str = "fhdr-uncensored",
     quality_profile: str = "high",
+    extreme_quality_mode: bool = False,
     quantize: int = 4,
     count: int = 1,
     output_dir: str | Path | None = None,
@@ -388,6 +417,7 @@ def generate_images(
         height=height,
         custom_steps=steps,
         custom_quantize=quantize,
+        extreme_quality_mode=extreme_quality_mode,
     )
 
     eff_width = cfg.width
@@ -397,6 +427,7 @@ def generate_images(
     eff_guidance = cfg.guidance
     eff_model = cfg.model_name
     eff_profile = cfg.quality_profile
+    eff_extreme = cfg.extreme_quality_mode
 
     results: list[ImageResult] = []
     count = max(1, min(4, count))
@@ -405,8 +436,9 @@ def generate_images(
     target_dir = Path(output_dir).expanduser().resolve() if output_dir and str(output_dir).strip() else IMAGES_OUTPUT_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    mode_label = f"{eff_profile.upper()} · 🔥極限" if eff_extreme else eff_profile.upper()
     if progress_callback:
-        progress_callback(0.05, f"正在載入 {eff_model.upper()} ({eff_profile.upper()} · {eff_quantize}-bit) 模型...")
+        progress_callback(0.05, f"正在載入 {eff_model.upper()} ({mode_label} · {eff_quantize}-bit) 模型...")
 
     # Load model if not resident
     model_key = f"{eff_model}_{eff_quantize}bit"
@@ -458,7 +490,7 @@ def generate_images(
         if progress_callback:
             progress_callback(
                 0.1 + 0.85 * (idx / count),
-                f"正在生成第 {idx+1}/{count} 張圖片 ({eff_model.upper()} · {eff_profile} · Seed: {current_seed})...",
+                f"正在生成第 {idx+1}/{count} 張圖片 ({eff_model.upper()} · {mode_label} · Seed: {current_seed})...",
             )
 
         timestamp_str = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -500,6 +532,7 @@ def generate_images(
                     "seed": current_seed,
                     "model": eff_model,
                     "quality_profile": eff_profile,
+                    "extreme_quality_mode": eff_extreme,
                     "quantize": eff_quantize,
                     "guidance": eff_guidance,
                 },
