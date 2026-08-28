@@ -531,19 +531,23 @@ async def get_image_history_endpoint():
 
 
 @app.post("/api/assets/upload")
-async def upload_asset_endpoint(data: dict):
-    """Register local image path or base64 into assets."""
-    file_path = data.get("file_path")
-    prompt = data.get("prompt", "")
-    if not file_path or not Path(file_path).exists():
-        raise HTTPException(status_code=400, detail="無效的檔案路徑")
+async def upload_asset_endpoint(file: UploadFile = File(...)):
+    """Accept real file upload from browser FormData, save to assets/uploads/, and return absolute path."""
+    time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_filename = f"{time_str}_{file.filename}"
+    upload_dir = ASSETS_DIR / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    target_path = upload_dir / safe_filename
+    with open(target_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
     rec = image_engine.register_asset(
         asset_type="IMAGE",
         source="UPLOAD",
-        file_path=file_path,
-        prompt=prompt,
+        file_path=target_path,
+        prompt="",
     )
-    return {"status": "ok", "asset": rec}
+    return {"status": "ok", "asset": rec, "path": str(target_path)}
 
 
 @app.get("/api/assets")
@@ -1386,9 +1390,21 @@ INDEX_HTML = """<!DOCTYPE html>
     async function handleStartImageUpload(event) {
       const file = event.target.files[0];
       if (!file) return;
-      showToast('正在載入圖片...');
-      // Read local filepath or save
-      setStartImage(file.path || file.name);
+      showToast('⏳ 正在上傳並處理圖片...');
+      const formData = new FormData();
+      formData.append('file', file);
+      try {
+        const res = await fetch('/api/assets/upload', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '上傳失敗');
+        setStartImage(data.path);
+        showToast('🎬 起始幀已成功就緒！');
+      } catch (e) {
+        showToast(`❌ 上傳失敗: ${e.message}`);
+      }
     }
 
     // Image Generation API
