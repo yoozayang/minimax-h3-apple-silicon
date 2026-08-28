@@ -1136,6 +1136,24 @@ INDEX_HTML = """<!DOCTYPE html>
           </button>
         </div>
 
+        <!-- Active Progress Card (Prominently placed below action buttons) -->
+        <div class="progress-card" id="progress-card" style="display:none; margin-top:0.4rem;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div style="display:flex; align-items:center; gap:0.5rem;">
+              <span class="indicator-dot"></span>
+              <span style="font-size:0.85rem; font-weight:700; color:#a5b4fc;" id="progress-stage-text">正在初始化...</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:0.6rem;">
+              <span style="font-size:0.8rem; font-family:'JetBrains Mono',monospace; color:var(--text-muted);" id="progress-time-text">⏱️ 0s</span>
+              <span style="font-size:0.95rem; font-family:'JetBrains Mono',monospace; font-weight:700; color:#818cf8;" id="progress-pct-text">0%</span>
+              <button class="btn-cancel-mini" onclick="cancelCurrentTask();" title="立即安全中斷並釋放顯存">🛑 中止生成</button>
+            </div>
+          </div>
+          <div class="progress-bar-bg" style="height:10px;">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+        </div>
+
         <!-- Generated Images Gallery -->
         <div class="images-gallery-wrap" id="images-gallery-wrap">
           <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -1215,20 +1233,6 @@ INDEX_HTML = """<!DOCTYPE html>
 
     <!-- Right Column: Player & Subtitles & History -->
     <div style="display:flex; flex-direction:column; gap:1.25rem;">
-      <!-- Active Progress Card (when running) -->
-      <div class="progress-card" id="progress-card" style="display:none;">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <span style="font-size:0.85rem; font-weight:700; color:#818cf8;" id="progress-stage-text">正在初始化...</span>
-          <div style="display:flex; align-items:center; gap:0.6rem;">
-            <span style="font-size:0.85rem; font-family:'JetBrains Mono',monospace; color:#a5b4fc;" id="progress-pct-text">0%</span>
-            <button class="btn-cancel-mini" onclick="cancelCurrentTask();" title="立即安全中斷並釋放顯存">🛑 中止生成</button>
-          </div>
-        </div>
-        <div class="progress-bar-bg">
-          <div class="progress-fill" id="progress-fill"></div>
-        </div>
-      </div>
-
       <!-- Player Wrap -->
       <div class="glass-card" id="player-wrap">
         <div class="card-title">
@@ -1673,6 +1677,8 @@ INDEX_HTML = """<!DOCTYPE html>
       });
     }
 
+    let lastHandledResultPath = null;
+
     // Reactive State Sync Loop
     async function syncJobState() {
       try {
@@ -1682,17 +1688,28 @@ INDEX_HTML = """<!DOCTYPE html>
         const pFill = document.getElementById('progress-fill');
         const pStage = document.getElementById('progress-stage-text');
         const pPct = document.getElementById('progress-pct-text');
+        const pTime = document.getElementById('progress-time-text');
         const stateText = document.getElementById('system-state-text');
 
         if (data.is_running) {
           pCard.style.display = 'flex';
-          pFill.style.width = `${Math.round(data.progress * 100)}%`;
+          pFill.style.width = `${Math.max(5, Math.round(data.progress * 100))}%`;
           pStage.innerText = data.stage || '生成中...';
           pPct.innerText = `${Math.round(data.progress * 100)}%`;
+          if (pTime) {
+            const min = (data.elapsed_sec / 60).toFixed(1);
+            pTime.innerText = `⏱️ ${min}m`;
+          }
           stateText.innerText = (data.job_type === 'IMAGE' ? '🎨 圖片生成中' : '🎬 影片去噪中');
         } else {
           pCard.style.display = 'none';
           stateText.innerText = 'Ready';
+          if (data.result && data.result.output_path && data.result.output_path !== lastHandledResultPath) {
+            lastHandledResultPath = data.result.output_path;
+            displayResult(data.result);
+            fetchHistory();
+            fetchQueue();
+          }
         }
       } catch (e) {}
     }
