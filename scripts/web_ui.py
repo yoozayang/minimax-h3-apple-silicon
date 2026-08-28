@@ -1258,7 +1258,7 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
 
           <!-- Image Generation Controls (Model & Quality Bar) -->
-          <div class="image-model-ctrl" style="display:flex; gap:0.6rem; align-items:center; background:rgba(11,15,23,0.6); padding:0.5rem 0.75rem; border-radius:8px; border:1px solid var(--card-border); margin-bottom:0.6rem; flex-wrap:wrap;">
+          <div class="image-model-ctrl" style="display:flex; justify-content:space-between; align-items:center; background:rgba(11,15,23,0.6); padding:0.5rem 0.75rem; border-radius:8px; border:1px solid var(--card-border); margin-bottom:0.6rem; gap:0.6rem; flex-wrap:wrap;">
             <div style="display:flex; align-items:center; gap:0.4rem;">
               <span style="font-size:0.75rem; font-weight:700; color:#818cf8;">🎨 模型:</span>
               <select id="image-model-select" style="font-size:0.75rem; padding:0.25rem 0.5rem; background:rgba(0,0,0,0.5); border:1px solid var(--card-border); color:var(--text-main); border-radius:6px; font-weight:600;">
@@ -1266,17 +1266,15 @@ INDEX_HTML = """<!DOCTYPE html>
                 <option value="flux2-klein-4b">⚡ FLUX.2 Klein 4B — Fast</option>
               </select>
             </div>
-            <div style="display:flex; align-items:center; gap:0.4rem; flex:1; min-width:200px;">
+            <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:nowrap;">
               <span style="font-size:0.75rem; font-weight:700; color:#a5b4fc;">品質:</span>
-              <div class="chips-container" id="img-quality-selector" style="display:flex; gap:0.25rem; flex:1;">
+              <div class="chips-container" id="img-quality-selector" style="display:flex; gap:0.25rem;">
                 <span class="chip" id="qchip-draft" onclick="setImageQuality('draft')">Draft</span>
                 <span class="chip" id="qchip-balanced" onclick="setImageQuality('balanced')">Balanced</span>
                 <span class="chip active" id="qchip-high" onclick="setImageQuality('high')">High</span>
                 <span class="chip" id="qchip-maximum" onclick="setImageQuality('maximum')">Maximum</span>
               </div>
-            </div>
-            <div style="display:flex; align-items:center; gap:0.3rem;">
-              <button id="btn-extreme-quality" class="btn-tiny" style="background:rgba(239,68,68,0.08); border-color:rgba(239,68,68,0.3); color:#fca5a5; font-weight:700; padding:0.25rem 0.55rem; border-radius:6px; cursor:pointer; transition:0.2s;" onclick="toggleExtremeQuality()" title="🔥 極限品質模式：不計耗時追求最高畫質（預設關閉）">🔥 極限品質: OFF</button>
+              <button id="btn-extreme-quality" class="btn-tiny" style="background:rgba(239,68,68,0.08); border-color:rgba(239,68,68,0.3); color:#fca5a5; font-weight:700; padding:0.25rem 0.55rem; border-radius:6px; cursor:pointer; transition:0.2s; white-space:nowrap; margin-left:0.2rem;" onclick="toggleExtremeQuality()" title="🔥 極限品質模式：不計耗時追求最高畫質（預設關閉）">🔥 極限品質: OFF</button>
             </div>
           </div>
 
