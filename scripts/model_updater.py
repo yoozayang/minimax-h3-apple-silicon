@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any
 from datetime import datetime
 
-from .image_engine import IMAGE_MODELS, check_hf_token_available
+try:
+    from image_engine import IMAGE_MODELS, check_hf_token_available
+except ImportError:
+    from .image_engine import IMAGE_MODELS, check_hf_token_available
 
 
 class ModelUpdater:
@@ -78,7 +81,7 @@ class ModelUpdater:
             token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
             from huggingface_hub import HfApi
-            api = HfApi(token=token if token_available else None)
+            api = HfApi(token=token if token else None)
 
             results = {}
             for model_id, m_info in IMAGE_MODELS.items():

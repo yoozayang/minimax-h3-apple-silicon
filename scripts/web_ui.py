@@ -554,7 +554,10 @@ async def generate_image_endpoint(req: ImageGenerateRequest):
 @app.on_event("startup")
 async def on_startup():
     try:
-        from .model_updater import model_updater
+        try:
+            from model_updater import model_updater
+        except ImportError:
+            from .model_updater import model_updater
         model_updater.start_background_loop()
     except Exception as e:
         print(f"Warning: Failed to start model updater loop: {e}", file=sys.stderr)
@@ -562,13 +565,19 @@ async def on_startup():
 
 @app.get("/api/models/update-status")
 async def get_models_update_status():
-    from .model_updater import model_updater
+    try:
+        from model_updater import model_updater
+    except ImportError:
+        from .model_updater import model_updater
     return model_updater.get_status()
 
 
 @app.post("/api/models/check-updates")
 async def check_models_updates_now():
-    from .model_updater import model_updater
+    try:
+        from model_updater import model_updater
+    except ImportError:
+        from .model_updater import model_updater
     return model_updater.check_and_sync_all(force_download=False)
 
 
@@ -1782,15 +1791,49 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     async function handleGenerateImageClick() {
-      const prompt = document.getElementById('prompt').value.trim();
+      const promptEl = document.getElementById('prompt');
+      const prompt = promptEl ? promptEl.value.trim() : '';
       if (!prompt) {
-        showToast('⚠️ 請先輸入提示詞！');
+        if (promptEl) {
+          promptEl.focus();
+          promptEl.style.borderColor = '#ef4444';
+          setTimeout(() => { promptEl.style.borderColor = 'var(--card-border)'; }, 1500);
+        }
+        showToast('⚠️ 請在輸入框填寫提示詞後再點擊生成圖片！');
         return;
       }
       const model_name = document.getElementById('image-model-select')?.value || 'fhdr-uncensored';
       const output_dir = (document.getElementById('output-dir')?.value || '').trim();
       const modeText = extremeQualityMode ? `${currentImageQuality.toUpperCase()} · 🔥極限` : currentImageQuality.toUpperCase();
+
+      // Show L3 progress card immediately
+      const pCard = document.getElementById('progress-card');
+      const pStage = document.getElementById('progress-stage-text');
+      const pFill = document.getElementById('progress-fill');
+      const pPct = document.getElementById('progress-pct-text');
+      if (pCard) pCard.style.display = 'block';
+      if (pStage) pStage.innerText = `🎨 [ImageEngine] 正在準備 ${model_name.toUpperCase()} (${modeText})...`;
+      if (pFill) pFill.style.width = '10%';
+      if (pPct) pPct.innerText = '10%';
+
       showToast(`🎨 開始使用 ${model_name.toUpperCase()} (${modeText}) 生成圖片...`);
+
+      // Start periodic progress polling
+      const pollTimer = setInterval(async () => {
+        try {
+          const sRes = await fetch('/api/job');
+          if (sRes.ok) {
+            const job = await sRes.json();
+            if (job.is_running && job.job_type === 'IMAGE') {
+              if (pStage && job.stage) pStage.innerText = job.stage;
+              const pct = Math.round((job.progress || 0.1) * 100);
+              if (pFill) pFill.style.width = `${pct}%`;
+              if (pPct) pPct.innerText = `${pct}%`;
+            }
+          }
+        } catch(e) {}
+      }, 500);
+
       try {
         const res = await fetch('/api/image/generate', {
           method: 'POST',
@@ -1808,11 +1851,18 @@ INDEX_HTML = """<!DOCTYPE html>
             output_dir: output_dir
           })
         });
+        clearInterval(pollTimer);
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || '圖片生成失敗');
-        showToast('✅ 圖片生成成功！');
+        if (pStage) pStage.innerText = '✅ 圖片生成完成！';
+        if (pFill) pFill.style.width = '100%';
+        if (pPct) pPct.innerText = '100%';
+        showToast('✅ 圖片生成成功！已加入下方圖片庫。');
         await fetchImageHistory();
+        setTimeout(() => { if (pCard) pCard.style.display = 'none'; }, 2500);
       } catch (e) {
+        clearInterval(pollTimer);
+        if (pStage) pStage.innerText = `❌ ${e.message}`;
         showToast(`❌ ${e.message}`);
       }
     }
