@@ -1042,6 +1042,112 @@ INDEX_HTML = """<!DOCTYPE html>
     .collapsible-content { padding: 0.85rem; display: none; flex-direction: column; gap: 0.75rem; border-top: 1px solid var(--card-border); }
     .collapsible.open .collapsible-content { display: flex; }
 
+    /* History Section Styles */
+    .history-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 1rem;
+      width: 100%;
+    }
+    .history-item {
+      position: relative;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid var(--card-border);
+      background: rgba(11, 15, 23, 0.7);
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      transition: 0.2s ease;
+    }
+    .history-item:hover {
+      border-color: var(--primary-accent);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(99,102,241,0.25);
+    }
+    .history-video-thumb {
+      aspect-ratio: 16/9;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .history-video-thumb video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .history-prompt {
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: var(--text-main);
+      padding: 0.6rem 0.75rem 0.3rem 0.75rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .history-footer {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+      padding: 0 0.75rem 0.6rem 0.75rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .btn-hide-item {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.75);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 50%;
+      width: 22px;
+      height: 22px;
+      font-size: 11px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transition: 0.2s ease;
+    }
+    .history-item:hover .btn-hide-item {
+      opacity: 1;
+    }
+    .history-list-view {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      width: 100%;
+    }
+    .history-list-row {
+      background: rgba(11, 15, 23, 0.7);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 0.6rem 0.85rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      transition: 0.15s ease;
+    }
+    .history-list-row:hover {
+      border-color: var(--primary-accent);
+      background: rgba(99, 102, 241, 0.08);
+    }
+    .chips-container { display: flex; align-items: center; gap: 0.4rem; }
+    .chip {
+      font-size: 0.75rem; padding: 0.2rem 0.55rem; border-radius: 6px;
+      background: rgba(255,255,255,0.05); border: 1px solid var(--card-border);
+      color: var(--text-muted); cursor: pointer; transition: 0.15s;
+    }
+    .chip.active { background: rgba(99,102,241,0.25); color: #a5b4fc; border-color: rgba(99,102,241,0.4); font-weight:600; }
+
     .toast {
       position: fixed; bottom: 2rem; right: 2rem;
       background: rgba(15, 23, 42, 0.95); border: 1px solid var(--card-border);
@@ -1072,248 +1178,257 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
   </header>
 
-  <main>
-    <!-- Left Column: Unified Workspace -->
-    <div style="display:flex; flex-direction:column; gap:1.25rem;">
-      <!-- Unified Prompt Box -->
-      <div class="glass-card">
-        <div class="card-title">
-          <span>✨ 統一提示詞工作區 (Unified Workspace)</span>
-          <span style="font-size:0.75rem; font-weight:400; color:var(--text-muted);">支援生圖 · 生影片 · 圖生影</span>
-        </div>
-
-        <!-- Video Conditioning Mode Switcher -->
-        <div class="mode-nav">
-          <div class="mode-tab active" id="tab-mode-text" onclick="switchVideoMode('text')">📝 純文字生影片</div>
-          <div class="mode-tab" id="tab-mode-image" onclick="switchVideoMode('image')">🖼️ 首幀圖生影片 (I2V)</div>
-          <div class="mode-tab" id="tab-mode-reference" onclick="switchVideoMode('reference')">🏷️ 參考特徵 (Ref)</div>
-        </div>
-
-        <!-- Start Image Panel (for I2V mode) -->
-        <div id="start-image-panel" style="display:none; flex-direction:column; gap:0.5rem;">
-          <label>🎬 影片起始幀 (Start Frame Image) <span style="font-size:0.7rem; color:#818cf8;">首幀像素注入 H3 FL2VA</span></label>
-          <div class="dropzone-box" onclick="document.getElementById('start-image-file').click();">
-            <img id="start-image-thumb" class="dropzone-preview" src="" style="display:none;" />
-            <div id="start-image-placeholder" style="flex:1;">
-              <span style="font-size:0.8rem; color:var(--text-muted);">點擊或拖曳上傳圖片 (或從下方已生成圖片點選「設為起始幀」)</span>
-            </div>
-            <button class="btn-tiny" id="btn-clear-start-image" style="display:none;" onclick="event.stopPropagation(); clearStartImage();">✕ 清除</button>
-            <input type="file" id="start-image-file" accept="image/*" style="display:none;" onchange="handleStartImageUpload(event);" />
+  <main style="display:flex; flex-direction:column; gap:1.5rem;">
+    <!-- Top 2-Column Main Workspace -->
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:1.25rem;">
+      <!-- Left Column: Unified Workspace -->
+      <div style="display:flex; flex-direction:column; gap:1.25rem;">
+        <!-- Unified Prompt Box -->
+        <div class="glass-card">
+          <div class="card-title">
+            <span>✨ 統一提示詞工作區 (Unified Workspace)</span>
+            <span style="font-size:0.75rem; font-weight:400; color:var(--text-muted);">支援生圖 · 生影片 · 圖生影</span>
           </div>
-        </div>
 
-        <!-- Reference Subjects Panel (for Reference mode) -->
-        <div id="reference-panel" style="display:none; flex-direction:column; gap:0.5rem;">
-          <label>🏷️ 角色 / 物件參考特徵 (Reference Subjects) <span style="font-size:0.7rem; color:#a855f7;">H3 多模態條件注入</span></label>
-          <div style="background:rgba(11,15,23,0.5); padding:0.6rem; border-radius:8px; border:1px solid var(--card-border); display:flex; flex-direction:column; gap:0.4rem;">
-            <div style="display:flex; gap:0.5rem; align-items:center;">
-              <input type="text" id="ref-subject-name" placeholder="主體名稱 (例如: Money / 女主角 / 跑車)" style="flex:1; font-size:0.8rem;" />
-              <button class="btn-tiny" onclick="addRefSubjectImage();">➕ 加圖</button>
-            </div>
-            <div id="ref-images-list" style="display:flex; gap:0.4rem; flex-wrap:wrap;"></div>
+          <!-- Video Conditioning Mode Switcher -->
+          <div class="mode-nav">
+            <div class="mode-tab active" id="tab-mode-text" onclick="switchVideoMode('text')">📝 純文字生影片</div>
+            <div class="mode-tab" id="tab-mode-image" onclick="switchVideoMode('image')">🖼️ 首幀圖生影片 (I2V)</div>
+            <div class="mode-tab" id="tab-mode-reference" onclick="switchVideoMode('reference')">🏷️ 參考特徵 (Ref)</div>
           </div>
-        </div>
 
-        <!-- Prompt Textarea -->
-        <div class="form-group">
-          <label for="prompt">
-            <span>創意提示詞 (Prompt)</span>
-            <span style="font-size:0.7rem; color:var(--text-muted);">多行自動支援批次排程</span>
-          </label>
-          <textarea id="prompt" placeholder="輸入描述 (例如: A cinematic shot of a happy golden retriever running in a park, soft sunlight filtering through trees)"></textarea>
-        </div>
-
-        <!-- Action Buttons Bar -->
-        <div class="btn-action-row">
-          <button class="btn-gen-img" onclick="handleGenerateImageClick();" title="使用 MFLUX 快速生成 1~4 張圖片構圖">
-            <span>🖼️ 生成圖片</span>
-          </button>
-          <button class="btn-gen-vid" id="btn-gen-video" onclick="handleGenerateVideoClick();" title="立即開始生成影片">
-            <span>🚀 生成影片</span>
-          </button>
-          <button class="btn-add-q" onclick="handleAddToQueueClick();" title="將提示詞加入佇列排程">
-            <span>➕ 加入排程</span>
-          </button>
-        </div>
-
-        <!-- Active Progress Card (Prominently placed below action buttons) -->
-        <div class="progress-card" id="progress-card" style="display:none; margin-top:0.4rem;">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div style="display:flex; align-items:center; gap:0.5rem;">
-              <span class="indicator-dot"></span>
-              <span style="font-size:0.85rem; font-weight:700; color:#a5b4fc;" id="progress-stage-text">正在初始化...</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:0.6rem;">
-              <span style="font-size:0.8rem; font-family:'JetBrains Mono',monospace; color:var(--text-muted);" id="progress-time-text">⏱️ 0s</span>
-              <span style="font-size:0.95rem; font-family:'JetBrains Mono',monospace; font-weight:700; color:#818cf8;" id="progress-pct-text">0%</span>
-              <button class="btn-cancel-mini" onclick="cancelCurrentTask();" title="立即安全中斷並釋放顯存">🛑 中止生成</button>
+          <!-- Start Image Panel (for I2V mode) -->
+          <div id="start-image-panel" style="display:none; flex-direction:column; gap:0.5rem;">
+            <label>🎬 影片起始幀 (Start Frame Image) <span style="font-size:0.7rem; color:#818cf8;">首幀像素注入 H3 FL2VA</span></label>
+            <div class="dropzone-box" onclick="document.getElementById('start-image-file').click();">
+              <img id="start-image-thumb" class="dropzone-preview" src="" style="display:none;" />
+              <div id="start-image-placeholder" style="flex:1;">
+                <span style="font-size:0.8rem; color:var(--text-muted);">點擊或拖曳上傳圖片 (或從下方已生成圖片點選「設為起始幀」)</span>
+              </div>
+              <button class="btn-tiny" id="btn-clear-start-image" style="display:none;" onclick="event.stopPropagation(); clearStartImage();">✕ 清除</button>
+              <input type="file" id="start-image-file" accept="image/*" style="display:none;" onchange="handleStartImageUpload(event);" />
             </div>
           </div>
-          <div class="progress-bar-bg" style="height:10px;">
-            <div class="progress-fill" id="progress-fill"></div>
-          </div>
-        </div>
 
-        <!-- Generated Images Gallery -->
-        <div class="images-gallery-wrap" id="images-gallery-wrap">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-size:0.8rem; font-weight:700;">🖼️ 本機生成圖片庫 (Image Gallery)</span>
-            <button class="btn-tiny" onclick="fetchImageHistory();">🔄 重新整理</button>
-          </div>
-          <div class="images-grid" id="images-grid">
-            <span style="font-size:0.75rem; color:var(--text-muted);">尚無生成圖片，點擊「生成圖片」立即探索構圖！</span>
-          </div>
-        </div>
-
-        <!-- Video Profile & Settings Drawer -->
-        <div class="collapsible open">
-          <div class="collapsible-header" onclick="toggleCollapsible(this)">
-            <span>⚙️ 影片生成規格與長度設定</span>
-            <span>▼</span>
-          </div>
-          <div class="collapsible-content">
-            <div class="form-group">
-              <label>影片規格檔位 (Profile)</label>
-              <select id="video-profile" onchange="handleProfileChange(this.value)">
-                <option value="fast" selected>⚡ 快速預覽 (768x448 · ~2.0s · 10 Steps)</option>
-                <option value="standard">🎬 標準長度 (960x544 · ~2.5s · 15 Steps)</option>
-                <option value="hd720">🌟 720p 高畫質 (1280x720 · ~2.0s · 15 Steps)</option>
-                <option value="long">📽️ 長影片分段延續模式 (Long Continuation)</option>
-                <option value="custom">🛠️ 自訂參數 (Custom)</option>
-              </select>
+          <!-- Reference Subjects Panel (for Reference mode) -->
+          <div id="reference-panel" style="display:none; flex-direction:column; gap:0.5rem;">
+            <label>🏷️ 角色 / 物件參考特徵 (Reference Subjects) <span style="font-size:0.7rem; color:#a855f7;">H3 多模態條件注入</span></label>
+            <div style="background:rgba(11,15,23,0.5); padding:0.6rem; border-radius:8px; border:1px solid var(--card-border); display:flex; flex-direction:column; gap:0.4rem;">
+              <div style="display:flex; gap:0.5rem; align-items:center;">
+                <input type="text" id="ref-subject-name" placeholder="主體名稱 (例如: Money / 女主角 / 跑車)" style="flex:1; font-size:0.8rem;" />
+                <button class="btn-tiny" onclick="addRefSubjectImage();">➕ 加圖</button>
+              </div>
+              <div id="ref-images-list" style="display:flex; gap:0.4rem; flex-wrap:wrap;"></div>
             </div>
+          </div>
 
-            <!-- Long Mode Target Duration -->
-            <div id="long-mode-box" style="display:none; flex-direction:column; gap:0.4rem; background:rgba(99,102,241,0.08); padding:0.6rem; border-radius:8px; border:1px solid rgba(99,102,241,0.25);">
-              <label style="color:#a5b4fc;">📽️ 長影片目標長度 (Target Duration)</label>
-              <select id="long-target-duration" style="font-family:'JetBrains Mono',monospace;">
-                <option value="5.0">5.0 秒 (約 2 個分段)</option>
-                <option value="10.0" selected>10.0 秒 (約 4~5 個分段)</option>
-                <option value="15.0">15.0 秒 (約 6~7 個分段)</option>
-                <option value="30.0">30.0 秒 (極長敘事鏡頭)</option>
-              </select>
+          <!-- Prompt Textarea -->
+          <div class="form-group">
+            <label for="prompt">
+              <span>創意提示詞 (Prompt)</span>
+              <span style="font-size:0.7rem; color:var(--text-muted);">多行自動支援批次排程</span>
+            </label>
+            <textarea id="prompt" placeholder="輸入描述 (例如: A cinematic shot of a happy golden retriever running in a park, soft sunlight filtering through trees)"></textarea>
+          </div>
+
+          <!-- Action Buttons Bar -->
+          <div class="btn-action-row">
+            <button class="btn-gen-img" onclick="handleGenerateImageClick();" title="使用 MFLUX 快速生成 1~4 張圖片構圖">
+              <span>🖼️ 生成圖片</span>
+            </button>
+            <button class="btn-gen-vid" id="btn-gen-video" onclick="handleGenerateVideoClick();" title="立即開始生成影片">
+              <span>🚀 生成影片</span>
+            </button>
+            <button class="btn-add-q" onclick="handleAddToQueueClick();" title="將提示詞加入佇列排程">
+              <span>➕ 加入排程</span>
+            </button>
+          </div>
+
+          <!-- Active Progress Card (Prominently placed below action buttons) -->
+          <div class="progress-card" id="progress-card" style="display:none; margin-top:0.4rem;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <div style="display:flex; align-items:center; gap:0.5rem;">
+                <span class="indicator-dot"></span>
+                <span style="font-size:0.85rem; font-weight:700; color:#a5b4fc;" id="progress-stage-text">正在初始化...</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:0.6rem;">
+                <span style="font-size:0.8rem; font-family:'JetBrains Mono',monospace; color:var(--text-muted);" id="progress-time-text">⏱️ 0s</span>
+                <span style="font-size:0.95rem; font-family:'JetBrains Mono',monospace; font-weight:700; color:#818cf8;" id="progress-pct-text">0%</span>
+                <button class="btn-cancel-mini" onclick="cancelCurrentTask();" title="立即安全中斷並釋放顯存">🛑 中止生成</button>
+              </div>
             </div>
+            <div class="progress-bar-bg" style="height:10px;">
+              <div class="progress-fill" id="progress-fill"></div>
+            </div>
+          </div>
 
-            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.6rem;">
+          <!-- Generated Images Gallery -->
+          <div class="images-gallery-wrap" id="images-gallery-wrap">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-size:0.8rem; font-weight:700;">🖼️ 本機生成圖片庫 (Image Gallery)</span>
+              <button class="btn-tiny" onclick="fetchImageHistory();">🔄 重新整理</button>
+            </div>
+            <div class="images-grid" id="images-grid">
+              <span style="font-size:0.75rem; color:var(--text-muted);">尚無生成圖片，點擊「生成圖片」立即探索構圖！</span>
+            </div>
+          </div>
+
+          <!-- Video Profile & Settings Drawer -->
+          <div class="collapsible open">
+            <div class="collapsible-header" onclick="toggleCollapsible(this)">
+              <span>⚙️ 影片生成規格與長度設定</span>
+              <span>▼</span>
+            </div>
+            <div class="collapsible-content">
               <div class="form-group">
-                <label>解析度寬高</label>
-                <div style="display:flex; gap:0.3rem;">
-                  <input type="number" id="custom-w" value="768" style="width:50%;" />
-                  <input type="number" id="custom-h" value="448" style="width:50%;" />
+                <label>影片規格檔位 (Profile)</label>
+                <select id="video-profile" onchange="handleProfileChange(this.value)">
+                  <option value="fast" selected>⚡ 快速預覽 (768x448 · ~2.0s · 10 Steps)</option>
+                  <option value="standard">🎬 標準長度 (960x544 · ~2.5s · 15 Steps)</option>
+                  <option value="hd720">🌟 720p 高畫質 (1280x720 · ~2.0s · 15 Steps)</option>
+                  <option value="long">📽️ 長影片分段延續模式 (Long Continuation)</option>
+                  <option value="custom">🛠️ 自訂參數 (Custom)</option>
+                </select>
+              </div>
+
+              <!-- Long Mode Target Duration -->
+              <div id="long-mode-box" style="display:none; flex-direction:column; gap:0.4rem; background:rgba(99,102,241,0.08); padding:0.6rem; border-radius:8px; border:1px solid rgba(99,102,241,0.25);">
+                <label style="color:#a5b4fc;">📽️ 長影片目標長度 (Target Duration)</label>
+                <select id="long-target-duration" style="font-family:'JetBrains Mono',monospace;">
+                  <option value="5.0">5.0 秒 (約 2 個分段)</option>
+                  <option value="10.0" selected>10.0 秒 (約 4~5 個分段)</option>
+                  <option value="15.0">15.0 秒 (約 6~7 個分段)</option>
+                  <option value="30.0">30.0 秒 (極長敘事鏡頭)</option>
+                </select>
+              </div>
+
+              <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.6rem;">
+                <div class="form-group">
+                  <label>解析度寬高</label>
+                  <div style="display:flex; gap:0.3rem;">
+                    <input type="number" id="custom-w" value="768" style="width:50%;" />
+                    <input type="number" id="custom-h" value="448" style="width:50%;" />
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label>採樣步數 (Steps)</label>
+                  <input type="number" id="custom-steps" value="10" min="4" max="60" />
                 </div>
               </div>
-              <div class="form-group">
-                <label>採樣步數 (Steps)</label>
-                <input type="number" id="custom-steps" value="10" min="4" max="60" />
-              </div>
             </div>
+          </div>
+        </div>
+
+        <!-- Prompt Queue Drawer -->
+        <div class="glass-card">
+          <div class="card-title">
+            <div style="display:flex; align-items:center; gap:0.5rem;">
+              <span>📋 排程隊列 (Queue)</span>
+              <span id="queue-count-badge" style="font-size:0.7rem; background:rgba(99,102,241,0.2); color:#a5b4fc; padding:0.15rem 0.5rem; border-radius:9999px;">0 筆</span>
+            </div>
+            <div style="display:flex; gap:0.4rem; align-items:center;">
+              <label style="font-size:0.75rem; cursor:pointer; display:flex; align-items:center; gap:0.3rem;">
+                <input type="checkbox" id="auto-queue-toggle" checked onchange="toggleAutoQueue();" />
+                <span>🔁 自動連續生成</span>
+              </label>
+            </div>
+          </div>
+          <div id="queue-list" style="display:flex; flex-direction:column; gap:0.5rem; max-height:280px; overflow-y:auto;">
+            <span style="font-size:0.75rem; color:var(--text-muted);">目前無排程工作。</span>
           </div>
         </div>
       </div>
 
-      <!-- Prompt Queue Drawer -->
-      <div class="glass-card">
-        <div class="card-title">
-          <div style="display:flex; align-items:center; gap:0.5rem;">
-            <span>📋 排程隊列 (Queue)</span>
-            <span id="queue-count-badge" style="font-size:0.7rem; background:rgba(99,102,241,0.2); color:#a5b4fc; padding:0.15rem 0.5rem; border-radius:9999px;">0 筆</span>
+      <!-- Right Column: Player & Subtitles -->
+      <div style="display:flex; flex-direction:column; gap:1.25rem;">
+        <!-- Player Wrap -->
+        <div class="glass-card" id="player-wrap">
+          <div class="card-title">
+            <span>🎬 預覽與播放中心</span>
+            <div style="display:flex; gap:0.4rem;" id="player-toolbar">
+              <select id="play-speed" style="font-size:0.75rem; padding:0.2rem 0.4rem;" onchange="setPlaySpeed(this.value)">
+                <option value="0.5">0.5x</option>
+                <option value="1.0" selected>1.0x</option>
+                <option value="1.5">1.5x</option>
+                <option value="2.0">2.0x</option>
+              </select>
+              <button class="btn-tiny" id="btn-loop" onclick="toggleLoop()">🔁 循環</button>
+            </div>
           </div>
-          <div style="display:flex; gap:0.4rem; align-items:center;">
-            <label style="font-size:0.75rem; cursor:pointer; display:flex; align-items:center; gap:0.3rem;">
-              <input type="checkbox" id="auto-queue-toggle" checked onchange="toggleAutoQueue();" />
-              <span>🔁 自動連續生成</span>
-            </label>
+
+          <div class="player-container">
+            <div class="empty-state" id="empty-state">
+              <div style="font-size:2.2rem; margin-bottom:0.5rem;">📽️</div>
+              <div>目前尚無載入影片</div>
+              <div style="font-size:0.75rem; margin-top:0.3rem;">點擊排程卡片、歷史紀錄或開始生成</div>
+            </div>
+            <video id="video-player" controls autoplay loop playsinline style="display:none;"></video>
           </div>
-        </div>
-        <div id="queue-list" style="display:flex; flex-direction:column; gap:0.5rem; max-height:280px; overflow-y:auto;">
-          <span style="font-size:0.75rem; color:var(--text-muted);">目前無排程工作。</span>
+
+          <!-- Video Metadata Grid -->
+          <div id="meta-grid" style="display:none; grid-template-columns: repeat(4, 1fr); gap:0.4rem; font-size:0.75rem; font-family:'JetBrains Mono',monospace; background:rgba(11,15,23,0.6); padding:0.6rem; border-radius:8px;">
+            <div><span style="color:var(--text-muted);">解析度:</span> <span id="meta-res">--</span></div>
+            <div><span style="color:var(--text-muted);">時長:</span> <span id="meta-dur">--</span></div>
+            <div><span style="color:var(--text-muted);">Seed:</span> <span id="meta-seed">--</span></div>
+            <div><span style="color:var(--text-muted);">耗時:</span> <span id="meta-time">--</span></div>
+          </div>
+
+          <!-- Subtitle Editor Drawer -->
+          <div class="collapsible open" id="subtitles-drawer">
+            <div class="collapsible-header" onclick="toggleCollapsible(this)">
+              <span>💬 後期字幕編輯 (秒級快速壓制另存)</span>
+              <span>▼</span>
+            </div>
+            <div class="collapsible-content">
+              <div class="form-group">
+                <input type="text" id="sub-text" placeholder="輸入要插入的字幕內容..." />
+              </div>
+              <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:0.5rem;">
+                <div class="form-group">
+                  <label>樣式</label>
+                  <select id="sub-style">
+                    <option value="box" selected>🔳 半透明黑底框</option>
+                    <option value="classic">🔲 經典白字黑邊</option>
+                    <option value="highlight">🟨 高對比亮黃</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>位置</label>
+                  <select id="sub-pos">
+                    <option value="bottom" selected>底部置中</option>
+                    <option value="top">頂部置中</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>操作</label>
+                  <button class="btn-tiny" style="height:35px; background:rgba(99,102,241,0.25); color:#a5b4fc; font-weight:700;" onclick="burnSubtitles();">💾 壓制新影片</button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- Right Column: Player & Subtitles & History -->
-    <div style="display:flex; flex-direction:column; gap:1.25rem;">
-      <!-- Player Wrap -->
-      <div class="glass-card" id="player-wrap">
-        <div class="card-title">
-          <span>🎬 預覽與播放中心</span>
-          <div style="display:flex; gap:0.4rem;" id="player-toolbar">
-            <select id="play-speed" style="font-size:0.75rem; padding:0.2rem 0.4rem;" onchange="setPlaySpeed(this.value)">
-              <option value="0.5">0.5x</option>
-              <option value="1.0" selected>1.0x</option>
-              <option value="1.5">1.5x</option>
-              <option value="2.0">2.0x</option>
-            </select>
-            <button class="btn-tiny" id="btn-loop" onclick="toggleLoop()">🔁 循環</button>
-          </div>
+    <!-- Bottom: Full-Width History Showcase Drawer with Video Previews -->
+    <div class="glass-card collapsible open" id="history-drawer">
+      <div class="collapsible-header" onclick="toggleDrawer('history-drawer', 'history-arrow')">
+        <div style="display:flex; align-items:center; gap:0.75rem;">
+          <span style="font-size:1.05rem; font-weight:700; color:var(--text-main);">🕒 最近生成紀錄 (History)</span>
+          <span class="badge-status completed" id="history-count-badge">0 部影片</span>
         </div>
-
-        <div class="player-container">
-          <div class="empty-state" id="empty-state">
-            <div style="font-size:2.2rem; margin-bottom:0.5rem;">📽️</div>
-            <div>目前尚無載入影片</div>
-            <div style="font-size:0.75rem; margin-top:0.3rem;">點擊排程卡片、歷史紀錄或開始生成</div>
+        <div style="display:flex; align-items:center; gap:0.75rem;" onclick="event.stopPropagation();">
+          <div class="chips-container">
+            <span class="chip active" id="view-grid" onclick="setHistoryView('grid')">🖼️ 網格模式</span>
+            <span class="chip" id="view-list" onclick="setHistoryView('list')">📋 列表模式</span>
+            <button class="btn-tiny" id="btn-unhide" style="display:none;" onclick="resetHiddenHistory()">👁️ 顯示已隱藏 (<span id="hidden-count">0</span>)</button>
           </div>
-          <video id="video-player" controls autoplay loop playsinline style="display:none;"></video>
-        </div>
-
-        <!-- Video Metadata Grid -->
-        <div id="meta-grid" style="display:none; grid-template-columns: repeat(4, 1fr); gap:0.4rem; font-size:0.75rem; font-family:'JetBrains Mono',monospace; background:rgba(11,15,23,0.6); padding:0.6rem; border-radius:8px;">
-          <div><span style="color:var(--text-muted);">解析度:</span> <span id="meta-res">--</span></div>
-          <div><span style="color:var(--text-muted);">時長:</span> <span id="meta-dur">--</span></div>
-          <div><span style="color:var(--text-muted);">Seed:</span> <span id="meta-seed">--</span></div>
-          <div><span style="color:var(--text-muted);">耗時:</span> <span id="meta-time">--</span></div>
-        </div>
-
-        <!-- Subtitle Editor Drawer -->
-        <div class="collapsible open" id="subtitles-drawer">
-          <div class="collapsible-header" onclick="toggleCollapsible(this)">
-            <span>💬 後期字幕編輯 (秒級快速壓制另存)</span>
-            <span>▼</span>
-          </div>
-          <div class="collapsible-content">
-            <div class="form-group">
-              <input type="text" id="sub-text" placeholder="輸入要插入的字幕內容..." />
-            </div>
-            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:0.5rem;">
-              <div class="form-group">
-                <label>樣式</label>
-                <select id="sub-style">
-                  <option value="box" selected>🔳 半透明黑底框</option>
-                  <option value="classic">🔲 經典白字黑邊</option>
-                  <option value="highlight">🟨 高對比亮黃</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label>位置</label>
-                <select id="sub-pos">
-                  <option value="bottom" selected>底部置中</option>
-                  <option value="top">頂部置中</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label>操作</label>
-                <button class="btn-tiny" style="height:35px; background:rgba(99,102,241,0.25); color:#a5b4fc; font-weight:700;" onclick="burnSubtitles();">💾 壓制新影片</button>
-              </div>
-            </div>
-          </div>
+          <span id="history-arrow" style="cursor:pointer; color:var(--text-muted);">▲</span>
         </div>
       </div>
-
-      <!-- History Showcase Drawer -->
-      <div class="glass-card">
-        <div class="card-title">
-          <div style="display:flex; align-items:center; gap:0.5rem;">
-            <span>🕒 最近生成紀錄 (History)</span>
-            <span id="history-count-badge" style="font-size:0.7rem; background:rgba(255,255,255,0.06); padding:0.15rem 0.5rem; border-radius:9999px;">0 部</span>
-          </div>
-          <div style="display:flex; gap:0.3rem;">
-            <button class="btn-tiny" id="btn-view-grid" onclick="setHistoryView('grid')">🖼️ 網格</button>
-            <button class="btn-tiny" id="btn-view-list" onclick="setHistoryView('list')">📋 列表</button>
-          </div>
-        </div>
-        <div id="history-container" style="max-height:300px; overflow-y:auto; display:flex; flex-direction:column; gap:0.5rem;">
-          <span style="font-size:0.75rem; color:var(--text-muted);">尚無歷史紀錄。</span>
+      <div class="collapsible-content" style="padding:1rem 0 0 0; border:none; display:flex;">
+        <div id="history-container" class="history-grid">
+          <span style="color:var(--text-muted); font-size:0.85rem;">目前尚無歷史紀錄。</span>
         </div>
       </div>
     </div>
@@ -1340,6 +1455,14 @@ INDEX_HTML = """<!DOCTYPE html>
       el.parentElement.classList.toggle('open');
     }
 
+    function toggleDrawer(drawerId, arrowId) {
+      const drawer = document.getElementById(drawerId);
+      if (!drawer) return;
+      drawer.classList.toggle('open');
+      const arrow = document.getElementById(arrowId);
+      if (arrow) arrow.innerText = drawer.classList.contains('open') ? '▲' : '▼';
+    }
+
     function switchVideoMode(mode) {
       currentVideoMode = mode;
       document.querySelectorAll('.mode-tab').forEach(t => t.classList.remove('active'));
@@ -1352,7 +1475,8 @@ INDEX_HTML = """<!DOCTYPE html>
 
     function handleProfileChange(val) {
       const longBox = document.getElementById('long-mode-box');
-      longBox.style.display = (val === 'long') ? 'flex' : 'none';
+      if (longBox) longBox.style.display = (val === 'long') ? 'flex' : 'none';
+
       if (val === 'fast') {
         document.getElementById('custom-w').value = 768;
         document.getElementById('custom-h').value = 448;
@@ -1455,170 +1579,191 @@ INDEX_HTML = """<!DOCTYPE html>
         const items = await res.json();
         const grid = document.getElementById('images-grid');
         if (!items || items.length === 0) {
-          grid.innerHTML = `<span style="font-size:0.75rem; color:var(--text-muted);">尚無生成圖片。</span>`;
+          grid.innerHTML = '<span style="font-size:0.75rem; color:var(--text-muted);">尚無生成圖片。</span>';
           return;
         }
-        grid.innerHTML = items.slice(0, 8).map(img => `
+        grid.innerHTML = items.map(img => `
           <div class="img-card">
-            <img src="/api/video-stream?path=${encodeURIComponent(img.output_path)}" onclick="setStartImage('${img.output_path}')" title="點擊設為起始幀" />
+            <img src="/api/video-stream?path=${encodeURIComponent(img.path)}" alt="${img.prompt}" />
             <div class="img-card-actions">
-              <button class="btn-card-mini" onclick="setStartImage('${img.output_path}')">🎬 設起始幀</button>
-              <button class="btn-card-mini" onclick="openOutputFolder('${img.output_path}')">📂 Finder</button>
+              <button class="btn-tiny" onclick="setStartImage('${img.path}');">🎬 設起始幀</button>
+              <button class="btn-tiny" onclick="openOutputFolder('${img.path}')">📂 Finder</button>
             </div>
           </div>
         `).join('');
       } catch (e) {}
     }
 
-    // Video Generation API
+    // Video Generation
     async function handleGenerateVideoClick() {
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) {
-        showToast('⚠️ 請輸入提示詞！');
+        showToast('⚠️ 請輸入提示詞');
         return;
       }
-      const prof = document.getElementById('video-profile').value;
-      const isLong = (prof === 'long');
-      const targetDur = isLong ? parseFloat(document.getElementById('long-target-duration').value) : null;
+      const profile = document.getElementById('video-profile').value;
+      const isLong = (profile === 'long');
+      const targetDuration = isLong ? parseFloat(document.getElementById('long-target-duration').value || '10.0') : null;
+
+      const body = {
+        prompt: prompt,
+        profile: profile,
+        mode: currentVideoMode,
+        width: parseInt(document.getElementById('custom-w').value),
+        height: parseInt(document.getElementById('custom-h').value),
+        duration_sec: isLong ? 2.0 : 2.0,
+        steps: parseInt(document.getElementById('custom-steps').value),
+        start_image: (currentVideoMode === 'image') ? currentStartImagePath : null,
+        references: (currentVideoMode === 'reference') ? currentRefSubjects : null,
+        long_mode: isLong,
+        target_duration_sec: targetDuration,
+      };
 
       try {
         const res = await fetch('/api/generate', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            prompt: prompt,
-            profile: prof,
-            mode: currentVideoMode,
-            start_image: currentStartImagePath,
-            long_mode: isLong,
-            target_duration_sec: targetDur,
-            width: parseInt(document.getElementById('custom-w').value),
-            height: parseInt(document.getElementById('custom-h').value),
-            steps: parseInt(document.getElementById('custom-steps').value),
-            duration_sec: isLong ? 2.0 : 2.0
-          })
+          body: JSON.stringify(body)
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || '啟動失敗');
-        showToast('🚀 已啟動生成任務！');
+        if (!res.ok) throw new Error(data.detail || '生成啟動失敗');
+        showToast('🚀 已啟動生成！');
+        syncJobState();
       } catch (e) {
         showToast(`❌ ${e.message}`);
       }
     }
 
+    // Queue Management
     async function handleAddToQueueClick() {
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) {
-        showToast('⚠️ 請輸入提示詞！');
+        showToast('⚠️ 請輸入提示詞');
         return;
       }
+      const profile = document.getElementById('video-profile').value;
+      const isLong = (profile === 'long');
+      const targetDuration = isLong ? parseFloat(document.getElementById('long-target-duration').value || '10.0') : null;
+
       try {
         const res = await fetch('/api/queue/batch-add', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             prompts_text: prompt,
-            profile: document.getElementById('video-profile').value,
-            mode: currentVideoMode,
-            start_image: currentStartImagePath,
+            profile: profile,
             width: parseInt(document.getElementById('custom-w').value),
             height: parseInt(document.getElementById('custom-h').value),
+            duration_sec: isLong ? 2.0 : 2.0,
             steps: parseInt(document.getElementById('custom-steps').value),
-            duration_sec: 2.0
+            mode: currentVideoMode,
+            start_image: (currentVideoMode === 'image') ? currentStartImagePath : null,
+            references: (currentVideoMode === 'reference') ? currentRefSubjects : null,
           })
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || '加入排程失敗');
-        showToast(`➕ 已加入 ${data.added_count} 筆排程！`);
-        await fetchQueue();
+        showToast('➕ 已加入排程！');
+        document.getElementById('prompt').value = '';
+        fetchQueue();
       } catch (e) {
         showToast(`❌ ${e.message}`);
       }
     }
 
-    async function cancelCurrentTask() {
-      await fetch('/api/generate/cancel', {method: 'POST'});
-      showToast('🛑 已發送中斷請求...');
-    }
-
-    // Queue API
     async function fetchQueue() {
       try {
         const res = await fetch('/api/queue');
         const data = await res.json();
-        renderQueue(data.items || []);
-      } catch (e) {}
-    }
+        const list = document.getElementById('queue-list');
+        const badge = document.getElementById('queue-count-badge');
+        const autoCheck = document.getElementById('auto-queue-toggle');
+        if (autoCheck) autoCheck.checked = data.auto_enabled;
+        badge.innerText = `${data.items.length} 筆`;
 
-    function renderQueue(items) {
-      document.getElementById('queue-count-badge').innerText = `${items.length} 筆`;
-      const container = document.getElementById('queue-list');
-      if (items.length === 0) {
-        container.innerHTML = `<span style="font-size:0.75rem; color:var(--text-muted);">目前無排程工作。</span>`;
-        return;
-      }
-      container.innerHTML = items.map((item, idx) => {
-        const isDone = item.status === 'completed';
-        const isRun = item.status === 'running';
-        return `
-          <div class="queue-card ${item.status}" ${isDone ? `onclick='playQueueItem(${JSON.stringify(item)})' style="cursor:pointer;"` : ''}>
+        if (!data.items || data.items.length === 0) {
+          list.innerHTML = '<span style="font-size:0.75rem; color:var(--text-muted);">目前無排程工作。</span>';
+          return;
+        }
+
+        list.innerHTML = data.items.map(item => `
+          <div class="queue-card ${item.status}">
             <div class="queue-header">
-              <div style="display:flex; align-items:center; gap:0.4rem;">
-                <span style="color:var(--text-muted); font-family:'JetBrains Mono',monospace;">#${idx+1}</span>
-                <span class="badge-status ${item.status}">${item.status.toUpperCase()}</span>
-                <span style="color:var(--text-muted); font-size:0.7rem;">${item.width}x${item.height} · ${item.steps}st</span>
-              </div>
-              <div onclick="event.stopPropagation();" style="display:flex; gap:0.3rem;">
-                ${isDone ? `<button class="btn-tiny" style="background:rgba(99,102,241,0.25); color:#a5b4fc; font-weight:700;" onclick='playQueueItem(${JSON.stringify(item)})'>▶️ 播放</button>` : ''}
-                ${isDone && item.output_path ? `<button class="btn-tiny" onclick="openOutputFolder('${item.output_path}')">📂</button>` : ''}
+              <span class="badge-status ${item.status}">${item.status.toUpperCase()}</span>
+              <div style="display:flex; gap:0.3rem;">
+                ${item.status === 'completed' && item.output_path ? `
+                  <button class="btn-tiny" onclick="event.stopPropagation(); loadHistoryItem({output_path: '${item.output_path}', prompt: '${item.prompt.replace(/'/g, "\\'")}', width:${item.width||768}, height:${item.height||448}, duration_sec:${item.duration_sec||2.0}})">▶️ 播放</button>
+                  <button class="btn-tiny" onclick="event.stopPropagation(); openOutputFolder('${item.output_path}')">📂 資料夾</button>
+                ` : ''}
+                ${item.status === 'failed' || item.status === 'cancelled' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'retry')">🔄 重試</button>` : ''}
                 <button class="btn-tiny" onclick="queueAction('${item.id}', 'delete')">🗑️</button>
               </div>
             </div>
             <div style="font-size:0.8rem; color:var(--text-main);">${item.prompt}</div>
+            ${item.error_message ? `<div style="font-size:0.7rem; color:#f87171;">${item.error_message}</div>` : ''}
           </div>
-        `;
-      }).join('');
+        `).join('');
+      } catch (e) {}
     }
 
-    async function queueAction(id, act) {
+    async function queueAction(id, action) {
       await fetch('/api/queue/action', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({item_id: id, action: act})
+        body: JSON.stringify({item_id: id, action: action})
       });
-      await fetchQueue();
+      fetchQueue();
     }
 
-    function playQueueItem(item) {
-      if (!item) return;
-      displayResult(item);
-      document.getElementById('player-wrap').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    async function toggleAutoQueue() {
+      await fetch('/api/queue/toggle-auto', {method: 'POST'});
+      fetchQueue();
     }
 
+    async function cancelCurrentTask() {
+      await fetch('/api/generate/cancel', {method: 'POST'});
+      showToast('🛑 正在中斷任務...');
+    }
+
+    // Player & Subtitles
     function displayResult(res) {
+      if (!res) return;
       currentResult = res;
       const player = document.getElementById('video-player');
       const empty = document.getElementById('empty-state');
-      empty.style.display = 'none';
-      player.style.display = 'block';
-      const videoUrl = res.output_path ? `/api/video-stream?path=${encodeURIComponent(res.output_path)}` : `/outputs/${res.output_filename}`;
-      player.src = videoUrl;
-      player.play().catch(()=>{});
+      const meta = document.getElementById('meta-grid');
 
-      document.getElementById('meta-res').innerText = `${res.width}x${res.height}`;
-      document.getElementById('meta-dur').innerText = `${res.duration_sec || 2.0}s`;
-      document.getElementById('meta-seed').innerText = res.seed;
-      document.getElementById('meta-time').innerText = res.execution_time_sec ? `${(res.execution_time_sec/60).toFixed(1)}m` : '--';
-      document.getElementById('meta-grid').style.display = 'grid';
+      const vPath = res.output_path || (res.output_filename ? `/outputs/${res.output_filename}` : '');
+      if (vPath) {
+        player.src = `/api/video-stream?path=${encodeURIComponent(vPath)}`;
+        player.style.display = 'block';
+        empty.style.display = 'none';
+        meta.style.display = 'grid';
+
+        if (res.width && res.height) document.getElementById('meta-res').innerText = `${res.width}x${res.height}`;
+        if (res.duration_sec) document.getElementById('meta-dur').innerText = `${res.duration_sec}s`;
+        if (res.seed !== undefined) document.getElementById('meta-seed').innerText = `${res.seed}`;
+        if (res.execution_time_sec) document.getElementById('meta-time').innerText = `${(res.execution_time_sec/60).toFixed(1)}m`;
+      }
+    }
+
+    function toggleLoop() {
+      const p = document.getElementById('video-player');
+      p.loop = !p.loop;
+      document.getElementById('btn-loop').style.borderColor = p.loop ? '#6366f1' : 'var(--card-border)';
+    }
+
+    function setPlaySpeed(val) {
+      document.getElementById('video-player').playbackRate = parseFloat(val);
     }
 
     async function burnSubtitles() {
       const text = document.getElementById('sub-text').value.trim();
       if (!text || !currentResult || !currentResult.output_path) {
-        showToast('⚠️ 請先選擇影片並輸入字幕！');
+        showToast('⚠️ 請先輸入字幕並確認已有載入影片！');
         return;
       }
-      showToast('⏳ 正在進行秒級字幕壓制...');
+      showToast('⏳ 正在壓制字幕...');
       try {
         const res = await fetch('/api/subtitles/burn', {
           method: 'POST',
@@ -1640,33 +1785,126 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    async function fetchHistory() {
-      try {
-        const res = await fetch('/api/history');
-        const items = await res.json();
-        document.getElementById('history-count-badge').innerText = `${items.length} 部`;
-        const container = document.getElementById('history-container');
-        if (!items || items.length === 0) {
-          container.innerHTML = `<span style="font-size:0.75rem; color:var(--text-muted);">尚無歷史紀錄。</span>`;
-          return items;
-        }
-        container.innerHTML = items.map(item => `
-          <div class="queue-card" onclick='displayResult(${JSON.stringify(item)})' style="cursor:pointer;">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-              <span style="font-size:0.75rem; color:#818cf8; font-weight:700;">${item.output_filename}</span>
-              <button class="btn-tiny" onclick="event.stopPropagation(); openOutputFolder('${item.output_path}')">📂 Finder</button>
-            </div>
-            <div style="font-size:0.75rem; color:var(--text-muted);">${item.prompt}</div>
-          </div>
-        `).join('');
-        return items;
-      } catch (e) { return []; }
-    }
-
+    /* History Management: Grid/List View & Hide Individual Items */
     function setHistoryView(mode) {
       historyViewMode = mode;
       localStorage.setItem('minimax_history_view', mode);
+      const gridChip = document.getElementById('view-grid');
+      const listChip = document.getElementById('view-list');
+      if (gridChip) gridChip.classList.toggle('active', mode === 'grid');
+      if (listChip) listChip.classList.toggle('active', mode === 'list');
       fetchHistory();
+    }
+
+    function hideHistoryItem(key, event) {
+      if (event) event.stopPropagation();
+      if (!hiddenHistoryKeys.includes(key)) {
+        hiddenHistoryKeys.push(key);
+        localStorage.setItem('minimax_hidden_history', JSON.stringify(hiddenHistoryKeys));
+      }
+      showToast("已隱藏該部影片紀錄", 1500);
+      fetchHistory();
+    }
+
+    function resetHiddenHistory() {
+      hiddenHistoryKeys = [];
+      localStorage.setItem('minimax_hidden_history', JSON.stringify([]));
+      showToast("已重置並顯示所有隱藏影片", 1500);
+      fetchHistory();
+    }
+
+    async function fetchHistory() {
+      try {
+        const res = await fetch('/api/history');
+        if (!res.ok) return [];
+        const items = await res.json();
+        const container = document.getElementById('history-container');
+        const badge = document.getElementById('history-count-badge');
+        const unhideBtn = document.getElementById('btn-unhide');
+        const hiddenCountEl = document.getElementById('hidden-count');
+
+        if (unhideBtn && hiddenCountEl) {
+          const hiddenCount = hiddenHistoryKeys.length;
+          hiddenCountEl.innerText = hiddenCount;
+          unhideBtn.style.display = hiddenCount > 0 ? 'inline-block' : 'none';
+        }
+
+        if (!items || items.length === 0) {
+          badge.innerText = '0 部影片';
+          container.innerHTML = '<span style="color:var(--text-muted); font-size:0.85rem;">目前尚無歷史紀錄。</span>';
+          return [];
+        }
+
+        const visibleItems = items.filter(item => {
+          const key = item.output_filename || item.output_path;
+          return !hiddenHistoryKeys.includes(key);
+        });
+
+        badge.innerText = `${visibleItems.length} 部影片`;
+
+        if (visibleItems.length === 0) {
+          container.innerHTML = '<span style="color:var(--text-muted); font-size:0.85rem;">所有歷史影片均已隱藏，點擊右上角可還原顯示。</span>';
+          return visibleItems;
+        }
+
+        if (historyViewMode === 'list') {
+          container.className = 'history-list-view';
+          container.innerHTML = visibleItems.map(item => {
+            const key = item.output_filename || item.output_path;
+            const videoSrc = item.output_path ? `/api/video-stream?path=${encodeURIComponent(item.output_path)}` : (item.output_filename ? `/outputs/${item.output_filename}` : '');
+            return `
+              <div class="history-list-row" onclick='loadHistoryItem(${JSON.stringify(item)})'>
+                <div style="display:flex; align-items:center; gap:0.75rem; min-width:0; flex:1;">
+                  <span style="font-size:1.2rem; color:#818cf8;">🎬</span>
+                  <div style="min-width:0; flex:1;">
+                    <div style="font-size:0.85rem; font-weight:600; color:var(--text-main); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                      ${item.prompt}
+                    </div>
+                    <div style="font-size:0.7rem; color:var(--text-muted); font-family:'JetBrains Mono',monospace; display:flex; gap:0.5rem; margin-top:0.2rem;">
+                      <span>${item.output_filename || ''}</span>
+                      <span>•</span>
+                      <span>${item.width}x${item.height}</span>
+                      <span>•</span>
+                      <span>${item.duration_sec}s</span>
+                      ${item.execution_time_sec ? `<span>• ${(item.execution_time_sec/60).toFixed(1)}m</span>` : ''}
+                    </div>
+                  </div>
+                </div>
+                <div style="display:flex; gap:0.4rem; align-items:center;" onclick="event.stopPropagation();">
+                  <button class="btn-tiny" onclick='loadHistoryItem(${JSON.stringify(item)})' title="在播放器播放">▶️ 播放</button>
+                  <button class="btn-tiny" onclick="openOutputFolder('${item.output_path || ''}')" title="在 Finder 開啟">📂 資料夾</button>
+                  <button class="btn-tiny" onclick="hideHistoryItem('${key}', event)" title="從列表中隱藏">✕ 隱藏</button>
+                </div>
+              </div>
+            `;
+          }).join('');
+        } else {
+          container.className = 'history-grid';
+          container.innerHTML = visibleItems.map(item => {
+            const key = item.output_filename || item.output_path;
+            const videoSrc = item.output_path ? `/api/video-stream?path=${encodeURIComponent(item.output_path)}` : (item.output_filename ? `/outputs/${item.output_filename}` : '');
+            return `
+              <div class="history-item" onclick='loadHistoryItem(${JSON.stringify(item)})'>
+                <button class="btn-hide-item" onclick="hideHistoryItem('${key}', event)" title="隱藏這部影片">✕</button>
+                <div class="history-video-thumb">
+                  ${videoSrc ? `<video src="${videoSrc}" preload="metadata" muted onmouseover="this.play()" onmouseout="this.pause()"></video>` : '<div style="color:var(--text-muted); font-size:0.75rem;">無預覽</div>'}
+                </div>
+                <div class="history-prompt" title="${item.prompt}">${item.prompt}</div>
+                <div class="history-footer">
+                  <span>${item.width}x${item.height} (${item.duration_sec}s)</span>
+                  <span>${item.execution_time_sec ? (item.execution_time_sec/60).toFixed(1)+'m' : ''}</span>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+        return visibleItems;
+      } catch (e) { return []; }
+    }
+
+    function loadHistoryItem(item) {
+      if (!item) return;
+      displayResult(item);
     }
 
     function openOutputFolder(p) {
@@ -1719,8 +1957,12 @@ INDEX_HTML = """<!DOCTYPE html>
         const res = await fetch('/api/status');
         const data = await res.json();
         if (data.memory) {
-          document.getElementById('mem-used').innerText = `${data.memory.used_gib} GB`;
-          document.getElementById('mem-total').innerText = `${data.memory.total_gib} GB`;
+          const used = data.memory.active_gib !== undefined && data.memory.active_gib > 0 ? data.memory.active_gib : (data.memory.total_ram_gib * (100 - data.memory.free_pct) / 100).toFixed(1);
+          const total = data.memory.total_ram_gib || 32.0;
+          const memUsedEl = document.getElementById('mem-used');
+          const memTotalEl = document.getElementById('mem-total');
+          if (memUsedEl) memUsedEl.innerText = `${used} GB`;
+          if (memTotalEl) memTotalEl.innerText = `${total} GB`;
         }
       } catch (e) {}
     }
