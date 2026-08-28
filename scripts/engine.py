@@ -194,6 +194,8 @@ def get_history(limit: int = 20) -> list[dict]:
                             candidate = OUTPUTS_DIR / item["output_filename"]
                             if candidate.exists():
                                 item["output_path"] = str(candidate)
+                        p = item.get("output_path")
+                        item["file_exists"] = bool(p and Path(p).exists() and Path(p).is_file())
                         records.append(item)
                     except json.JSONDecodeError:
                         continue

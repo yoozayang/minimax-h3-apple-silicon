@@ -1368,6 +1368,7 @@ INDEX_HTML = """<!DOCTYPE html>
         const isRun = item.status === 'running';
         const isFail = item.status === 'failed';
         const isCancel = item.status === 'cancelled';
+        const isCompleted = item.status === 'completed';
         const statusMap = {
           'queued': '⏳ 排程中',
           'running': '▶️ 生成中',
@@ -1377,15 +1378,17 @@ INDEX_HTML = """<!DOCTYPE html>
           'paused': '⏸️ 已暫停'
         };
         return `
-          <div class="queue-card ${item.status}">
+          <div class="queue-card ${item.status}" ${isCompleted ? `onclick='playQueueItem(${JSON.stringify(item)})' style="cursor:pointer;"` : ''}>
             <div class="queue-header">
               <div style="display:flex; align-items:center; gap:0.4rem;">
                 <span style="color:var(--text-muted); font-family:'JetBrains Mono',monospace;">#${idx+1}</span>
                 <span class="badge-status ${item.status}">${statusMap[item.status] || item.status}</span>
                 <span style="color:var(--text-muted); font-size:0.7rem;">${item.width}x${item.height} · ${item.duration_sec}s · ${item.steps}st</span>
               </div>
-              <div class="queue-actions">
-                ${(isFail || isCancel || item.status === 'completed') ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'retry')" title="重新排程">🔄 Retry</button>` : ''}
+              <div class="queue-actions" onclick="event.stopPropagation();">
+                ${isCompleted ? `<button class="btn-tiny" style="background:rgba(99,102,241,0.25); color:#a5b4fc; font-weight:700;" onclick='playQueueItem(${JSON.stringify(item)})' title="在播放器中播放此影片">▶️ 播放</button>` : ''}
+                ${isCompleted && item.output_path ? `<button class="btn-tiny" onclick="openOutputFolderForPath('${item.output_path}')" title="開啟所在資料夾">📂</button>` : ''}
+                ${(isFail || isCancel || isCompleted) ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'retry')" title="重新排程">🔄 Retry</button>` : ''}
                 ${item.status === 'queued' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'run_now')" title="立即開始執行">⚡ 立即</button>` : ''}
                 ${item.status === 'queued' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'pause')" title="暫停">⏸️</button>` : ''}
                 ${item.status === 'paused' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'resume')" title="恢復">▶️</button>` : ''}
@@ -1397,6 +1400,24 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
         `;
       }).join('');
+    }
+
+    function playQueueItem(item) {
+      if (!item) return;
+      displayResult(item);
+      const playerWrap = document.getElementById('player-wrap');
+      if (playerWrap) {
+        playerWrap.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      showToast(`🎬 載入影片：${(item.prompt || '').slice(0, 20)}...`);
+    }
+
+    function openOutputFolderForPath(path) {
+      fetch('/api/open-folder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({file_path: path})
+      });
     }
 
     async function handleAddToQueueClick() {
@@ -1859,8 +1880,11 @@ INDEX_HTML = """<!DOCTYPE html>
       await fetchQueue();
       await syncJobState();
       const historyList = await fetchHistory();
-      if (!currentResult && historyList && historyList.length > 0 && historyList[0].output_filename) {
-        displayResult(historyList[0]);
+      if (!currentResult && historyList && historyList.length > 0) {
+        const validItem = historyList.find(i => i.file_exists || (i.output_path && i.output_path.length > 0) || i.output_filename);
+        if (validItem) {
+          displayResult(validItem);
+        }
       }
       setInterval(syncJobState, 1500);
       setInterval(fetchQueue, 2500);
