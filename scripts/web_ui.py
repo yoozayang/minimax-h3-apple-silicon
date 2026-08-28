@@ -747,14 +747,16 @@ async def get_history():
 
 @app.get("/api/video-stream")
 async def stream_video(path: str = Query(...)):
-    """Serve video directly from any local folder with standard headers."""
+    """Serve media directly from any local folder with standard headers."""
     decoded_path = urllib.parse.unquote(path)
     file_path = Path(decoded_path).expanduser().resolve()
     if not file_path.exists() or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="影片檔案不存在")
+        raise HTTPException(status_code=404, detail="檔案不存在")
+    import mimetypes
+    mime, _ = mimetypes.guess_type(str(file_path))
     return FileResponse(
         path=str(file_path),
-        media_type="video/mp4",
+        media_type=mime or "application/octet-stream",
         filename=file_path.name,
     )
 
@@ -1367,17 +1369,19 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     // Start Image Handler
-    function setStartImage(filePath) {
+    function setStartImage(filePath, localBlobUrl) {
       currentStartImagePath = filePath;
       switchVideoMode('image');
       const thumb = document.getElementById('start-image-thumb');
       const placeholder = document.getElementById('start-image-placeholder');
       const clearBtn = document.getElementById('btn-clear-start-image');
-      thumb.src = `/api/video-stream?path=${encodeURIComponent(filePath)}`;
+      thumb.src = localBlobUrl || `/api/video-stream?path=${encodeURIComponent(filePath)}`;
       thumb.style.display = 'block';
       placeholder.style.display = 'none';
       clearBtn.style.display = 'block';
-      showToast('🎬 已設定為影片起始幀 (I2V)！');
+      if (filePath) {
+        showToast('🎬 已設定為影片起始幀 (I2V)！');
+      }
     }
 
     function clearStartImage() {
@@ -1390,7 +1394,9 @@ INDEX_HTML = """<!DOCTYPE html>
     async function handleStartImageUpload(event) {
       const file = event.target.files[0];
       if (!file) return;
-      showToast('⏳ 正在上傳並處理圖片...');
+      const blobUrl = URL.createObjectURL(file);
+      setStartImage('', blobUrl);
+      showToast('⏳ 正在上傳並儲存圖片...');
       const formData = new FormData();
       formData.append('file', file);
       try {
@@ -1400,10 +1406,11 @@ INDEX_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || '上傳失敗');
-        setStartImage(data.path);
+        currentStartImagePath = data.path;
         showToast('🎬 起始幀已成功就緒！');
       } catch (e) {
         showToast(`❌ 上傳失敗: ${e.message}`);
+        clearStartImage();
       }
     }
 
