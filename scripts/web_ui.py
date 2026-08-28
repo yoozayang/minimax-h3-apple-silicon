@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
-"""Lightweight local Web UI for MiniMax-H3 on Apple Silicon."""
+"""Lightweight local Web UI for MiniMax-H3 on Apple Silicon with Prompt Queue and Post-Processing Subtitles."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 # Dynamically resolve project directory
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 LOGS_DIR = BASE_DIR / "logs"
+QUEUE_FILE = LOGS_DIR / "queue.jsonl"
 
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -33,7 +37,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="MiniMax-H3 Local Web UI")
+app = FastAPI(title="MiniMax-H3 Local Studio")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,8 +62,51 @@ CURRENT_JOB = {
     "steps": 10,
     "seed": -1,
     "output_dir": "",
+    "active_queue_id": None,
+    "cancel_event": None,
 }
 JOB_LOCK = threading.Lock()
+
+# Prompt Queue State
+AUTO_QUEUE_ENABLED = True
+PROMPT_QUEUE: list[dict] = []
+QUEUE_LOCK = threading.Lock()
+
+
+def load_queue_from_file():
+    global PROMPT_QUEUE
+    if not QUEUE_FILE.exists():
+        return
+    with QUEUE_LOCK:
+        PROMPT_QUEUE = []
+        try:
+            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            item = json.loads(line)
+                            # Reset running items to queued on restart
+                            if item.get("status") == "running":
+                                item["status"] = "queued"
+                            PROMPT_QUEUE.append(item)
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as e:
+            print(f"Warning: Failed to load queue: {e}", file=sys.stderr)
+
+
+def save_queue_to_file():
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+            for item in PROMPT_QUEUE:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Warning: Failed to save queue: {e}", file=sys.stderr)
+
+
+load_queue_from_file()
 
 
 class GenerateRequest(BaseModel):
@@ -71,22 +118,245 @@ class GenerateRequest(BaseModel):
     seed: int = -1
     steps: int = 10
     output_dir: str = ""
-    subtitle_text: str = ""
-    subtitle_position: str = "bottom"
-    subtitle_style: str = "box"
-    subtitle_font_size: int = 24
+    queue_id: str | None = None
 
 
-def is_port_in_use(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(("127.0.0.1", port)) == 0
+class BatchAddRequest(BaseModel):
+    prompts_text: str
+    profile: str = "fast"
+    width: int = 768
+    height: int = 448
+    duration_sec: float = 2.0
+    steps: int = 10
+    seed: int = -1
+    output_dir: str = ""
 
 
-def find_free_port(start_port: int = 7860, max_port: int = 7890) -> int:
-    for port in range(start_port, max_port + 1):
-        if not is_port_in_use(port):
-            return port
-    return start_port
+class QueueActionRequest(BaseModel):
+    item_id: str
+    action: str  # retry, run_now, pause, resume, delete, move_top
+
+
+class SubtitleBurnRequest(BaseModel):
+    video_path: str
+    text: str
+    start_sec: float = 0.0
+    end_sec: float | None = None
+    position: str = "bottom"
+    style: str = "box"
+    font_size: int = 24
+
+
+def summarize_error(err_str: str) -> str:
+    """Format raw error into concise human-readable summary."""
+    low = err_str.lower()
+    if "victim of gpu error/recovery" in low or "insufficient memory" in low or "out of memory" in low:
+        return "⚠️ 顯存爆量 (OOM) - 建議降低秒數 (2~3s) 或解析度"
+    if "operation not permitted" in low:
+        return "⚠️ 目錄權限受限 - 建議改用專案預設資料夾"
+    if "task was cancelled" in low or "interrupted" in low:
+        return "🛑 使用者手動取消"
+    if "swap" in low:
+        return "⚠️ 虛擬記憶體交換過載 - 建議減少併發或重啟"
+    # Truncate clean message
+    clean = err_str.replace("\n", " ").strip()
+    return clean[:90] + ("..." if len(clean) > 90 else "")
+
+
+def execute_generation_task(
+    prompt: str,
+    width: int,
+    height: int,
+    duration_sec: float,
+    steps: int,
+    seed: int,
+    output_dir: str,
+    queue_id: str | None = None,
+    profile: str = "fast",
+):
+    global CURRENT_JOB
+    cancel_event = threading.Event()
+    with JOB_LOCK:
+        CURRENT_JOB["is_running"] = True
+        CURRENT_JOB["stage"] = "Starting generation..."
+        CURRENT_JOB["progress"] = 0.01
+        CURRENT_JOB["result"] = None
+        CURRENT_JOB["error"] = None
+        CURRENT_JOB["started_at"] = time.time()
+        CURRENT_JOB["prompt"] = prompt.strip()
+        CURRENT_JOB["width"] = width
+        CURRENT_JOB["height"] = height
+        CURRENT_JOB["duration_sec"] = duration_sec
+        CURRENT_JOB["steps"] = steps
+        CURRENT_JOB["seed"] = seed
+        CURRENT_JOB["output_dir"] = output_dir
+        CURRENT_JOB["active_queue_id"] = queue_id
+        CURRENT_JOB["cancel_event"] = cancel_event
+
+    # Mark queue item as running if from queue
+    if queue_id:
+        with QUEUE_LOCK:
+            for item in PROMPT_QUEUE:
+                if item["id"] == queue_id:
+                    item["status"] = "running"
+                    item["error_message"] = None
+                    break
+            save_queue_to_file()
+
+    def on_stage(stage_text: str, progress_val: float):
+        with JOB_LOCK:
+            CURRENT_JOB["stage"] = stage_text
+            CURRENT_JOB["progress"] = progress_val
+
+    try:
+        w = width
+        h = height
+        dur = max(0.5, min(15.08, duration_sec))
+        st = max(4, min(60, steps))
+        seed_val = seed if seed >= 0 else None
+        custom_out = output_dir.strip() if output_dir and output_dir.strip() else str(OUTPUTS_DIR)
+
+        res = engine.generate_video(
+            prompt=prompt,
+            width=w,
+            height=h,
+            duration_sec=dur,
+            seed=seed_val,
+            steps=st,
+            output_dir=custom_out,
+            cancel_event=cancel_event,
+            on_stage=on_stage,
+        )
+
+        if not res.success:
+            if "cancelled" in (res.error_message or "").lower() or (cancel_event and cancel_event.is_set()):
+                raise InterruptedError("Generation task was cancelled by user.")
+            raise RuntimeError(res.error_message or "Generation failed")
+
+        with JOB_LOCK:
+            CURRENT_JOB["is_running"] = False
+            CURRENT_JOB["progress"] = 1.0
+            CURRENT_JOB["stage"] = "Completed successfully!"
+            CURRENT_JOB["result"] = engine.asdict(res)
+            CURRENT_JOB["cancel_event"] = None
+
+        if queue_id:
+            with QUEUE_LOCK:
+                for item in PROMPT_QUEUE:
+                    if item["id"] == queue_id:
+                        item["status"] = "completed"
+                        item["output_path"] = res.output_path
+                        break
+                save_queue_to_file()
+
+    except InterruptedError:
+        # User manually cancelled
+        with JOB_LOCK:
+            CURRENT_JOB["is_running"] = False
+            CURRENT_JOB["stage"] = "Cancelled."
+            CURRENT_JOB["error"] = "Generation was cancelled by user."
+            CURRENT_JOB["progress"] = 0.0
+            CURRENT_JOB["cancel_event"] = None
+
+        # Move to end of queue with cancelled status
+        with QUEUE_LOCK:
+            target_item = None
+            if queue_id:
+                for idx, item in enumerate(PROMPT_QUEUE):
+                    if item["id"] == queue_id:
+                        target_item = PROMPT_QUEUE.pop(idx)
+                        break
+            if target_item is None:
+                target_item = {
+                    "id": str(uuid.uuid4())[:8],
+                    "prompt": prompt,
+                    "profile": profile,
+                    "width": width,
+                    "height": height,
+                    "duration_sec": duration_sec,
+                    "steps": steps,
+                    "seed": seed,
+                    "created_at": datetime.now().strftime("%H:%M:%S"),
+                    "output_path": None,
+                }
+            target_item["status"] = "cancelled"
+            target_item["error_message"] = "🛑 已手動取消"
+            PROMPT_QUEUE.append(target_item)
+            save_queue_to_file()
+
+    except Exception as e:
+        # Generation failed
+        err_msg = str(e)
+        friendly_err = summarize_error(err_msg)
+        with JOB_LOCK:
+            CURRENT_JOB["is_running"] = False
+            CURRENT_JOB["stage"] = "Generation failed."
+            CURRENT_JOB["error"] = friendly_err
+            CURRENT_JOB["progress"] = 0.0
+            CURRENT_JOB["cancel_event"] = None
+
+        # Move failed item to end of queue with error message
+        with QUEUE_LOCK:
+            target_item = None
+            if queue_id:
+                for idx, item in enumerate(PROMPT_QUEUE):
+                    if item["id"] == queue_id:
+                        target_item = PROMPT_QUEUE.pop(idx)
+                        break
+            if target_item is None:
+                target_item = {
+                    "id": str(uuid.uuid4())[:8],
+                    "prompt": prompt,
+                    "profile": profile,
+                    "width": width,
+                    "height": height,
+                    "duration_sec": duration_sec,
+                    "steps": steps,
+                    "seed": seed,
+                    "created_at": datetime.now().strftime("%H:%M:%S"),
+                    "output_path": None,
+                }
+            target_item["status"] = "failed"
+            target_item["error_message"] = friendly_err
+            PROMPT_QUEUE.append(target_item)
+            save_queue_to_file()
+
+
+def queue_worker_loop():
+    """Continuous background worker that triggers queued items when idle."""
+    while True:
+        time.sleep(1.5)
+        if not AUTO_QUEUE_ENABLED:
+            continue
+        with JOB_LOCK:
+            if CURRENT_JOB["is_running"]:
+                continue
+        # Find next queued item
+        next_item = None
+        with QUEUE_LOCK:
+            for item in PROMPT_QUEUE:
+                if item.get("status") == "queued":
+                    next_item = item
+                    break
+        if next_item:
+            threading.Thread(
+                target=execute_generation_task,
+                kwargs={
+                    "prompt": next_item["prompt"],
+                    "width": next_item.get("width", 768),
+                    "height": next_item.get("height", 448),
+                    "duration_sec": next_item.get("duration_sec", 2.0),
+                    "steps": next_item.get("steps", 10),
+                    "seed": next_item.get("seed", -1),
+                    "output_dir": next_item.get("output_dir", ""),
+                    "queue_id": next_item["id"],
+                    "profile": next_item.get("profile", "fast"),
+                },
+                daemon=True,
+            ).start()
+
+
+threading.Thread(target=queue_worker_loop, daemon=True).start()
 
 
 @app.get("/api/status")
@@ -101,6 +371,7 @@ async def get_status():
             "has_result": CURRENT_JOB["result"] is not None,
             "error": CURRENT_JOB["error"],
             "prompt": CURRENT_JOB.get("prompt", ""),
+            "active_queue_id": CURRENT_JOB.get("active_queue_id"),
         }
     return {
         "memory": mem,
@@ -110,6 +381,7 @@ async def get_status():
         "desktop_dir": str(Path("~/Desktop").expanduser().resolve()),
         "downloads_dir": str(Path("~/Downloads").expanduser().resolve()),
         "movies_dir": str(Path("~/Movies").expanduser().resolve()),
+        "auto_queue": AUTO_QUEUE_ENABLED,
     }
 
 
@@ -125,7 +397,167 @@ async def get_job():
             "prompt": CURRENT_JOB.get("prompt", ""),
             "result": CURRENT_JOB["result"],
             "error": CURRENT_JOB["error"],
+            "active_queue_id": CURRENT_JOB.get("active_queue_id"),
         }
+
+
+@app.post("/api/generate")
+async def start_generation(req: GenerateRequest):
+    with JOB_LOCK:
+        if CURRENT_JOB["is_running"]:
+            raise HTTPException(status_code=409, detail="已有生成任務正在執行中，請稍候或加入排程。")
+    thread = threading.Thread(
+        target=execute_generation_task,
+        kwargs={
+            "prompt": req.prompt,
+            "width": req.width,
+            "height": req.height,
+            "duration_sec": req.duration_sec,
+            "steps": req.steps,
+            "seed": req.seed,
+            "output_dir": req.output_dir,
+            "queue_id": req.queue_id,
+            "profile": req.profile,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return {"status": "started"}
+
+
+@app.post("/api/generate/cancel")
+async def cancel_generation():
+    with JOB_LOCK:
+        if not CURRENT_JOB["is_running"] or not CURRENT_JOB.get("cancel_event"):
+            return {"status": "not_running"}
+        CURRENT_JOB["cancel_event"].set()
+        CURRENT_JOB["stage"] = "Cancelling task..."
+    return {"status": "cancelling"}
+
+
+@app.get("/api/queue")
+async def get_queue():
+    with QUEUE_LOCK:
+        return {"items": PROMPT_QUEUE, "auto_enabled": AUTO_QUEUE_ENABLED}
+
+
+@app.post("/api/queue/batch-add")
+async def batch_add_queue(req: BatchAddRequest):
+    lines = [l.strip() for l in req.prompts_text.split("\n") if l.strip()]
+    if not lines:
+        raise HTTPException(status_code=400, detail="請輸入至少一筆提示詞")
+    added_items = []
+    with QUEUE_LOCK:
+        for line in lines:
+            item = {
+                "id": str(uuid.uuid4())[:8],
+                "prompt": line,
+                "profile": req.profile,
+                "width": req.width,
+                "height": req.height,
+                "duration_sec": req.duration_sec,
+                "steps": req.steps,
+                "seed": req.seed,
+                "output_dir": req.output_dir,
+                "status": "queued",
+                "error_message": None,
+                "created_at": datetime.now().strftime("%H:%M:%S"),
+                "output_path": None,
+            }
+            PROMPT_QUEUE.append(item)
+            added_items.append(item)
+        save_queue_to_file()
+    return {"status": "ok", "added_count": len(added_items), "items": PROMPT_QUEUE}
+
+
+@app.post("/api/queue/action")
+async def queue_action(req: QueueActionRequest):
+    global PROMPT_QUEUE
+    with QUEUE_LOCK:
+        target_idx = None
+        for idx, item in enumerate(PROMPT_QUEUE):
+            if item["id"] == req.item_id:
+                target_idx = idx
+                break
+        if target_idx is None:
+            raise HTTPException(status_code=404, detail="找不到指定排程項目")
+
+        item = PROMPT_QUEUE[target_idx]
+        if req.action == "delete":
+            PROMPT_QUEUE.pop(target_idx)
+        elif req.action == "retry":
+            item["status"] = "queued"
+            item["error_message"] = None
+        elif req.action == "pause":
+            item["status"] = "paused"
+        elif req.action == "resume":
+            item["status"] = "queued"
+        elif req.action == "move_top":
+            popped = PROMPT_QUEUE.pop(target_idx)
+            popped["status"] = "queued"
+            PROMPT_QUEUE.insert(0, popped)
+        elif req.action == "run_now":
+            with JOB_LOCK:
+                if CURRENT_JOB["is_running"]:
+                    raise HTTPException(status_code=409, detail="目前已有任務正在運行，請等待或先中止。")
+            popped = PROMPT_QUEUE.pop(target_idx)
+            popped["status"] = "running"
+            PROMPT_QUEUE.insert(0, popped)
+            save_queue_to_file()
+            threading.Thread(
+                target=execute_generation_task,
+                kwargs={
+                    "prompt": popped["prompt"],
+                    "width": popped.get("width", 768),
+                    "height": popped.get("height", 448),
+                    "duration_sec": popped.get("duration_sec", 2.0),
+                    "steps": popped.get("steps", 10),
+                    "seed": popped.get("seed", -1),
+                    "output_dir": popped.get("output_dir", ""),
+                    "queue_id": popped["id"],
+                    "profile": popped.get("profile", "fast"),
+                },
+                daemon=True,
+            ).start()
+            return {"status": "started", "items": PROMPT_QUEUE}
+
+        save_queue_to_file()
+    return {"status": "ok", "items": PROMPT_QUEUE}
+
+
+@app.post("/api/queue/toggle-auto")
+async def toggle_auto_queue():
+    global AUTO_QUEUE_ENABLED
+    AUTO_QUEUE_ENABLED = not AUTO_QUEUE_ENABLED
+    return {"status": "ok", "auto_enabled": AUTO_QUEUE_ENABLED}
+
+
+@app.post("/api/subtitles/burn")
+async def burn_subtitles_endpoint(req: SubtitleBurnRequest):
+    """Post-processing subtitle burn-in onto existing video file."""
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="請輸入字幕文字")
+    v_path = Path(req.video_path).expanduser().resolve()
+    if not v_path.exists() or not v_path.is_file():
+        raise HTTPException(status_code=404, detail="找不到指定的影片檔案")
+
+    try:
+        out_path = engine.burn_subtitles_to_video(
+            input_path=v_path,
+            text=req.text.strip(),
+            start_sec=req.start_sec,
+            end_sec=req.end_sec,
+            position=req.position,
+            style=req.style,
+            font_size=req.font_size,
+        )
+        return {
+            "status": "ok",
+            "output_path": out_path,
+            "output_filename": Path(out_path).name,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"字幕壓制失敗: {e}")
 
 
 @app.get("/api/history")
@@ -147,75 +579,6 @@ async def stream_video(path: str = Query(...)):
     )
 
 
-@app.post("/api/generate")
-async def start_generation(req: GenerateRequest):
-    global CURRENT_JOB
-    with JOB_LOCK:
-        if CURRENT_JOB["is_running"]:
-            raise HTTPException(status_code=409, detail="已有生成任務正在執行中，請稍候。")
-        CURRENT_JOB["is_running"] = True
-        CURRENT_JOB["stage"] = "Starting generation..."
-        CURRENT_JOB["progress"] = 0.01
-        CURRENT_JOB["result"] = None
-        CURRENT_JOB["error"] = None
-        CURRENT_JOB["started_at"] = time.time()
-        CURRENT_JOB["prompt"] = req.prompt.strip()
-        CURRENT_JOB["width"] = req.width
-        CURRENT_JOB["height"] = req.height
-        CURRENT_JOB["duration_sec"] = req.duration_sec
-        CURRENT_JOB["steps"] = req.steps
-        CURRENT_JOB["seed"] = req.seed
-        CURRENT_JOB["output_dir"] = req.output_dir
-
-    def run_task():
-        def on_stage(stage_text: str, progress_val: float):
-            with JOB_LOCK:
-                CURRENT_JOB["stage"] = stage_text
-                CURRENT_JOB["progress"] = progress_val
-
-        try:
-            w = req.width
-            h = req.height
-            dur = max(0.5, min(15.08, req.duration_sec))
-            st = max(4, min(60, req.steps))
-            seed_val = req.seed if req.seed >= 0 else None
-            custom_out = req.output_dir.strip() if req.output_dir and req.output_dir.strip() else str(OUTPUTS_DIR)
-
-            res = engine.generate_video(
-                prompt=req.prompt,
-                width=w,
-                height=h,
-                duration_sec=dur,
-                seed=seed_val,
-                steps=st,
-                output_dir=custom_out,
-                subtitle_text=req.subtitle_text,
-                subtitle_position=req.subtitle_position,
-                subtitle_style=req.subtitle_style,
-                subtitle_font_size=req.subtitle_font_size,
-                on_stage=on_stage,
-            )
-            with JOB_LOCK:
-                CURRENT_JOB["is_running"] = False
-                CURRENT_JOB["progress"] = 1.0
-                if res.success:
-                    CURRENT_JOB["stage"] = "Completed successfully!"
-                    CURRENT_JOB["result"] = engine.asdict(res)
-                else:
-                    CURRENT_JOB["stage"] = "Generation failed."
-                    CURRENT_JOB["error"] = res.error_message
-        except Exception as e:
-            with JOB_LOCK:
-                CURRENT_JOB["is_running"] = False
-                CURRENT_JOB["stage"] = "Generation failed."
-                CURRENT_JOB["error"] = str(e)
-                CURRENT_JOB["progress"] = 0.0
-
-    thread = threading.Thread(target=run_task, daemon=True)
-    thread.start()
-    return {"status": "started"}
-
-
 @app.post("/api/open-folder")
 async def open_output_folder(data: dict):
     file_path = data.get("file_path")
@@ -232,11 +595,10 @@ async def open_output_folder(data: dict):
         return {"status": "error", "message": str(e)}
 
 
-# Static mount for default output dir
 app.mount("/outputs", StaticFiles(directory=OUTPUTS_DIR), name="outputs")
 
 
-# Modern Single-Page App HTML
+# Complete SPA HTML with Prompt Queue & Subtitle Editor
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh-TW" class="dark">
 <head>
@@ -244,18 +606,18 @@ INDEX_HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MiniMax-H3 Local Studio</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://fonts.gstatic.com">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg-dark: #0b0f17;
-      --card-bg: rgba(20, 27, 41, 0.75);
+      --card-bg: rgba(20, 27, 41, 0.8);
       --card-border: rgba(255, 255, 255, 0.08);
       --primary-accent: #6366f1;
       --primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
+      --danger-gradient: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
       --text-main: #f3f4f6;
       --text-muted: #9ca3af;
-      --surface-hover: rgba(255, 255, 255, 0.04);
       --success: #10b981;
       --warning: #f59e0b;
       --danger: #ef4444;
@@ -285,72 +647,36 @@ INDEX_HTML = """<!DOCTYPE html>
       top: 0;
       z-index: 50;
     }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-    }
+    .brand { display: flex; align-items: center; gap: 0.75rem; }
     .brand-badge {
       background: var(--primary-gradient);
-      width: 38px;
-      height: 38px;
-      border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 800;
-      font-size: 1.2rem;
-      color: white;
+      width: 38px; height: 38px; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 1.2rem; color: white;
       box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
     }
-    .brand-text h1 {
-      font-size: 1.15rem;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-    }
-    .brand-text p {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-    }
-    .system-status {
-      display: flex;
-      align-items: center;
-      gap: 1rem;
-      font-size: 0.8rem;
-    }
+    .brand-text h1 { font-size: 1.15rem; font-weight: 700; }
+    .brand-text p { font-size: 0.75rem; color: var(--text-muted); }
+    .system-status { display: flex; align-items: center; gap: 1rem; font-size: 0.8rem; }
     .status-pill {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      padding: 0.35rem 0.85rem;
-      border-radius: 9999px;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      padding: 0.35rem 0.85rem; border-radius: 9999px;
+      display: flex; align-items: center; gap: 0.5rem;
       font-family: 'JetBrains Mono', monospace;
     }
     .indicator-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--success);
-      box-shadow: 0 0 8px var(--success);
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--success); box-shadow: 0 0 8px var(--success);
     }
     .indicator-dot.warning { background: var(--warning); box-shadow: 0 0 8px var(--warning); }
     .indicator-dot.danger { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
 
     main {
-      flex: 1;
-      max-width: 1300px;
-      margin: 0 auto;
-      padding: 2rem 1.5rem;
-      width: 100%;
-      display: grid;
-      grid-template-columns: 1fr 1.1fr;
-      gap: 2rem;
+      flex: 1; max-width: 1360px; margin: 0 auto;
+      padding: 2rem 1.5rem; width: 100%;
+      display: grid; grid-template-columns: 1fr 1.1fr; gap: 2rem;
     }
-    @media (max-width: 992px) {
-      main { grid-template-columns: 1fr; }
-    }
+    @media (max-width: 1024px) { main { grid-template-columns: 1fr; } }
 
     .glass-card {
       background: var(--card-bg);
@@ -360,390 +686,173 @@ INDEX_HTML = """<!DOCTYPE html>
       border-radius: 16px;
       padding: 1.5rem;
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-      display: flex;
-      flex-direction: column;
-      gap: 1.25rem;
+      display: flex; flex-direction: column; gap: 1.25rem;
     }
 
     .card-title {
-      font-size: 1.1rem;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      border-bottom: 1px solid var(--card-border);
-      padding-bottom: 0.75rem;
+      font-size: 1.1rem; font-weight: 700;
+      display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid var(--card-border); padding-bottom: 0.75rem;
     }
 
-    .form-group {
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-    }
-    label {
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: var(--text-muted);
-      display: flex;
-      justify-content: space-between;
-    }
+    .form-group { display: flex; flex-direction: column; gap: 0.5rem; }
+    label { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); display: flex; justify-content: space-between; }
     textarea, select, input {
-      background: rgba(11, 15, 23, 0.7);
-      border: 1px solid var(--card-border);
-      color: var(--text-main);
-      padding: 0.75rem 1rem;
-      border-radius: 10px;
-      font-family: inherit;
-      font-size: 0.95rem;
-      transition: all 0.2s ease;
-      outline: none;
+      background: rgba(11, 15, 23, 0.7); border: 1px solid var(--card-border);
+      color: var(--text-main); padding: 0.75rem 1rem; border-radius: 10px;
+      font-family: inherit; font-size: 0.95rem; outline: none; transition: 0.2s ease;
     }
     textarea:focus, select:focus, input:focus {
-      border-color: var(--primary-accent);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+      border-color: var(--primary-accent); box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
     }
-    textarea {
-      min-height: 100px;
-      resize: vertical;
-      line-height: 1.5;
-    }
+    textarea { min-height: 90px; resize: vertical; line-height: 1.5; }
 
-    .chips-container {
-      display: flex;
-      gap: 0.5rem;
-      flex-wrap: wrap;
-    }
+    .chips-container { display: flex; gap: 0.5rem; flex-wrap: wrap; }
     .chip {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--card-border);
-      font-size: 0.75rem;
-      padding: 0.25rem 0.6rem;
-      border-radius: 6px;
-      cursor: pointer;
-      color: var(--text-muted);
-      transition: 0.15s ease;
+      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--card-border);
+      font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 6px;
+      cursor: pointer; color: var(--text-muted); transition: 0.15s ease;
     }
-    .chip:hover {
-      background: rgba(99, 102, 241, 0.2);
-      color: var(--text-main);
-      border-color: var(--primary-accent);
-    }
-    .chip.active {
-      background: rgba(99, 102, 241, 0.3);
-      color: #a5b4fc;
-      border-color: #818cf8;
-      font-weight: 600;
-    }
+    .chip:hover { background: rgba(99, 102, 241, 0.2); color: var(--text-main); border-color: var(--primary-accent); }
+    .chip.active { background: rgba(99, 102, 241, 0.35); color: #c7d2fe; border-color: #818cf8; font-weight: 600; }
 
-    .duration-control-box, .path-control-box, .subtitle-control-box {
-      background: rgba(11, 15, 23, 0.5);
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      padding: 0.85rem 1rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.6rem;
+    .duration-control-box, .path-control-box {
+      background: rgba(11, 15, 23, 0.5); border: 1px solid var(--card-border);
+      border-radius: 10px; padding: 0.85rem 1rem; display: flex; flex-direction: column; gap: 0.6rem;
     }
-    .duration-inputs {
-      display: flex;
-      align-items: center;
-      gap: 1rem;
-    }
-    .duration-num-input {
-      width: 100px;
-      font-family: 'JetBrains Mono', monospace;
-      font-weight: 700;
-      font-size: 1.05rem;
-      text-align: center;
-      color: #818cf8;
-    }
-    .duration-slider {
-      flex: 1;
-      height: 6px;
-      accent-color: #6366f1;
-      cursor: pointer;
-    }
-    .duration-calc-badge {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      font-family: 'JetBrains Mono', monospace;
-      display: flex;
-      justify-content: space-between;
-    }
+    .duration-inputs { display: flex; align-items: center; gap: 1rem; }
+    .duration-num-input { width: 95px; font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 1.05rem; text-align: center; color: #818cf8; }
+    .duration-slider { flex: 1; height: 6px; accent-color: #6366f1; cursor: pointer; }
+    .duration-calc-badge { font-size: 0.75rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; display: flex; justify-content: space-between; }
 
-    .path-row {
-      display: flex;
-      gap: 0.5rem;
-      align-items: center;
-    }
-    .path-input {
-      flex: 1;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.85rem;
-      padding: 0.6rem 0.8rem;
-    }
+    .path-row { display: flex; gap: 0.5rem; align-items: center; }
+    .path-input { flex: 1; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; padding: 0.6rem 0.8rem; }
 
     .collapsible {
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      overflow: hidden;
-      background: rgba(11, 15, 23, 0.4);
+      border: 1px solid var(--card-border); border-radius: 10px;
+      overflow: hidden; background: rgba(11, 15, 23, 0.4);
     }
     .collapsible-header {
-      padding: 0.75rem 1rem;
-      cursor: pointer;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: var(--text-muted);
+      padding: 0.75rem 1rem; cursor: pointer; display: flex;
+      justify-content: space-between; align-items: center;
+      font-size: 0.85rem; font-weight: 600; color: var(--text-muted);
     }
-    .collapsible-content {
-      padding: 1rem;
-      display: none;
-      flex-direction: column;
-      gap: 1rem;
-      border-top: 1px solid var(--card-border);
-    }
-    .collapsible.open .collapsible-content {
-      display: flex;
-    }
+    .collapsible-content { padding: 1rem; display: none; flex-direction: column; gap: 1rem; border-top: 1px solid var(--card-border); }
+    .collapsible.open .collapsible-content { display: flex; }
 
+    /* Button Actions */
+    .btn-row { display: flex; gap: 0.75rem; }
     .btn-generate {
-      background: var(--primary-gradient);
-      border: none;
-      color: white;
-      font-size: 1.05rem;
-      font-weight: 700;
-      padding: 1rem;
-      border-radius: 12px;
-      cursor: pointer;
-      transition: all 0.25s ease;
-      box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 0.5rem;
+      flex: 1; background: var(--primary-gradient); border: none; color: white;
+      font-size: 1.05rem; font-weight: 700; padding: 0.95rem; border-radius: 12px;
+      cursor: pointer; transition: all 0.25s ease; box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+      display: flex; justify-content: center; align-items: center; gap: 0.5rem;
     }
-    .btn-generate:hover:not(:disabled) {
-      transform: translateY(-2px);
-      box-shadow: 0 6px 24px rgba(99, 102, 241, 0.6);
+    .btn-generate:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 24px rgba(99, 102, 241, 0.6); }
+    .btn-cancel {
+      flex: 1; background: var(--danger-gradient); border: none; color: white;
+      font-size: 1.05rem; font-weight: 700; padding: 0.95rem; border-radius: 12px;
+      cursor: pointer; transition: all 0.2s ease; box-shadow: 0 4px 20px rgba(239, 68, 68, 0.4);
+      display: none; justify-content: center; align-items: center; gap: 0.5rem;
     }
-    .btn-generate:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-      transform: none;
+    .btn-cancel:hover { box-shadow: 0 6px 24px rgba(239, 68, 68, 0.6); transform: translateY(-2px); }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.06); border: 1px solid var(--card-border);
+      color: var(--text-main); padding: 0.6rem 0.85rem; border-radius: 8px;
+      font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: 0.2s ease;
+      display: flex; align-items: center; justify-content: center; gap: 0.4rem; text-decoration: none;
     }
+    .btn-secondary:hover { background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.2); }
 
     .progress-box {
-      background: rgba(11, 15, 23, 0.9);
-      border: 1px solid var(--card-border);
-      border-radius: 12px;
-      padding: 1rem;
-      display: none;
-      flex-direction: column;
-      gap: 0.75rem;
+      background: rgba(11, 15, 23, 0.9); border: 1px solid var(--card-border);
+      border-radius: 12px; padding: 1rem; display: none; flex-direction: column; gap: 0.75rem;
     }
-    .progress-bar-bg {
-      height: 8px;
-      background: rgba(255, 255, 255, 0.1);
-      border-radius: 4px;
-      overflow: hidden;
+    .progress-bar-bg { height: 8px; background: rgba(255, 255, 255, 0.1); border-radius: 4px; overflow: hidden; }
+    .progress-bar-fill { height: 100%; background: var(--primary-gradient); width: 0%; transition: width 0.3s ease; }
+    .stage-text { font-size: 0.85rem; color: #93c5fd; font-family: 'JetBrains Mono', monospace; }
+
+    /* Queue UI */
+    .queue-list { display: flex; flex-direction: column; gap: 0.6rem; max-height: 320px; overflow-y: auto; padding-right: 0.3rem; }
+    .queue-card {
+      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
+      border-radius: 8px; padding: 0.65rem 0.85rem; display: flex; flex-direction: column; gap: 0.4rem;
+      transition: 0.2s ease;
     }
-    .progress-bar-fill {
-      height: 100%;
-      background: var(--primary-gradient);
-      width: 0%;
-      transition: width 0.3s ease;
+    .queue-card.running { border-color: #10b981; background: rgba(16, 185, 129, 0.08); }
+    .queue-card.failed { border-color: rgba(239, 68, 68, 0.4); background: rgba(239, 68, 68, 0.05); }
+    .queue-header { display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; }
+    .badge-status {
+      padding: 0.2rem 0.5rem; border-radius: 4px; font-weight: 700; font-size: 0.7rem; text-transform: uppercase;
     }
-    .stage-text {
-      font-size: 0.85rem;
-      color: #93c5fd;
-      font-family: 'JetBrains Mono', monospace;
+    .badge-status.queued { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+    .badge-status.running { background: rgba(16, 185, 129, 0.25); color: #34d399; }
+    .badge-status.completed { background: rgba(99, 102, 241, 0.2); color: #a5b4fc; }
+    .badge-status.failed { background: rgba(239, 68, 68, 0.25); color: #f87171; }
+    .badge-status.cancelled { background: rgba(156, 163, 175, 0.2); color: #9ca3af; }
+    .badge-status.paused { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
+    .queue-prompt-text { font-size: 0.85rem; color: var(--text-main); word-break: break-word; line-height: 1.35; }
+    .queue-actions { display: flex; gap: 0.4rem; justify-content: flex-end; align-items: center; }
+    .btn-tiny {
+      background: rgba(255, 255, 255, 0.06); border: 1px solid var(--card-border);
+      color: var(--text-main); font-size: 0.7rem; padding: 0.2rem 0.45rem; border-radius: 4px; cursor: pointer;
     }
+    .btn-tiny:hover { background: rgba(255, 255, 255, 0.15); }
 
     /* Player and Result */
     .player-container {
-      border-radius: 12px;
-      overflow: hidden;
-      background: #000;
-      border: 1px solid var(--card-border);
-      aspect-ratio: 16 / 9;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      position: relative;
+      border-radius: 12px; overflow: hidden; background: #000;
+      border: 1px solid var(--card-border); aspect-ratio: 16 / 9;
+      display: flex; align-items: center; justify-content: center; position: relative;
     }
-    video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-    }
-    .empty-state {
-      color: var(--text-muted);
-      font-size: 0.9rem;
-      text-align: center;
-      padding: 2rem;
-    }
+    video { width: 100%; height: 100%; object-fit: contain; }
+    .empty-state { color: var(--text-muted); font-size: 0.9rem; text-align: center; padding: 2rem; }
 
-    /* Player Controls Bar */
     .player-control-bar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      background: rgba(11, 15, 23, 0.7);
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      padding: 0.5rem 0.85rem;
-      font-size: 0.8rem;
+      display: flex; justify-content: space-between; align-items: center;
+      background: rgba(11, 15, 23, 0.7); border: 1px solid var(--card-border);
+      border-radius: 10px; padding: 0.5rem 0.85rem; font-size: 0.8rem;
     }
-    .play-mode-chips {
-      display: flex;
-      gap: 0.35rem;
-      align-items: center;
-    }
+    .play-mode-chips { display: flex; gap: 0.35rem; align-items: center; }
     .play-chip {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--card-border);
-      padding: 0.25rem 0.55rem;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      transition: 0.15s ease;
+      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--card-border);
+      padding: 0.25rem 0.55rem; border-radius: 6px; cursor: pointer; font-size: 0.75rem; color: var(--text-muted);
     }
-    .play-chip:hover {
-      color: var(--text-main);
-      background: rgba(255, 255, 255, 0.1);
-    }
-    .play-chip.active {
-      background: rgba(99, 102, 241, 0.35);
-      color: #c7d2fe;
-      border-color: #818cf8;
-      font-weight: 600;
-    }
+    .play-chip.active { background: rgba(99, 102, 241, 0.35); color: #c7d2fe; border-color: #818cf8; font-weight: 600; }
 
-    .metadata-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 0.75rem;
-    }
+    .metadata-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; }
     .meta-card {
-      background: rgba(11, 15, 23, 0.6);
-      border: 1px solid var(--card-border);
-      padding: 0.6rem;
-      border-radius: 8px;
-      text-align: center;
+      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
+      padding: 0.6rem; border-radius: 8px; text-align: center;
     }
-    .meta-label {
-      font-size: 0.7rem;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    .meta-val {
-      font-size: 0.95rem;
-      font-weight: 700;
-      color: var(--text-main);
-      font-family: 'JetBrains Mono', monospace;
-      margin-top: 0.2rem;
-    }
-
-    .action-row {
-      display: flex;
-      gap: 0.75rem;
-    }
-    .btn-secondary {
-      flex: 1;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid var(--card-border);
-      color: var(--text-main);
-      padding: 0.6rem;
-      border-radius: 8px;
-      font-size: 0.85rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: 0.2s ease;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 0.4rem;
-      text-decoration: none;
-    }
-    .btn-secondary:hover {
-      background: rgba(255, 255, 255, 0.12);
-      border-color: rgba(255, 255, 255, 0.2);
-    }
+    .meta-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .meta-val { font-size: 0.95rem; font-weight: 700; color: var(--text-main); font-family: 'JetBrains Mono', monospace; margin-top: 0.2rem; }
 
     /* History section */
-    .history-section {
-      grid-column: 1 / -1;
-      margin-top: 1rem;
-    }
+    .history-section { grid-column: 1 / -1; margin-top: 1rem; }
     .history-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 1rem;
-      max-height: 480px;
-      overflow-y: auto;
-      padding-right: 0.5rem;
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1rem; max-height: 480px; overflow-y: auto; padding-right: 0.5rem;
     }
     .history-item {
-      background: rgba(11, 15, 23, 0.6);
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      padding: 0.75rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-      cursor: pointer;
-      transition: all 0.2s ease;
+      background: rgba(11, 15, 23, 0.6); border: 1px solid var(--card-border);
+      border-radius: 10px; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem;
+      cursor: pointer; transition: all 0.2s ease;
     }
-    .history-item:hover {
-      border-color: var(--primary-accent);
-      transform: translateY(-2px);
-    }
+    .history-item:hover { border-color: var(--primary-accent); transform: translateY(-2px); }
     .history-video-thumb {
-      width: 100%;
-      height: 140px;
-      background: #000;
-      border-radius: 6px;
-      overflow: hidden;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      width: 100%; height: 140px; background: #000; border-radius: 6px;
+      overflow: hidden; display: flex; align-items: center; justify-content: center;
     }
-    .history-prompt {
-      font-size: 0.8rem;
-      color: var(--text-main);
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-      line-height: 1.3;
-    }
-    .history-footer {
-      display: flex;
-      justify-content: space-between;
-      font-size: 0.7rem;
-      color: var(--text-muted);
-      font-family: 'JetBrains Mono', monospace;
-    }
+    .history-prompt { font-size: 0.8rem; color: var(--text-main); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.3; }
+    .history-footer { display: flex; justify-content: space-between; font-size: 0.7rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
 
     .toast-banner {
-      position: fixed;
-      bottom: 20px;
-      right: 20px;
-      background: rgba(239, 68, 68, 0.95);
-      color: white;
-      padding: 0.75rem 1.25rem;
-      border-radius: 10px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-      display: none;
-      z-index: 100;
-      font-size: 0.9rem;
-      font-weight: 600;
+      position: fixed; bottom: 20px; right: 20px;
+      background: rgba(30, 41, 59, 0.95); border: 1px solid var(--card-border);
+      color: white; padding: 0.75rem 1.25rem; border-radius: 10px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4); display: none; z-index: 100; font-size: 0.9rem; font-weight: 600;
     }
   </style>
 </head>
@@ -759,7 +868,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="system-status">
       <div class="status-pill">
         <span class="indicator-dot" id="pressure-dot"></span>
-        <span id="pressure-text">Memory: Checking...</span>
+        <span id="pressure-text">RAM: Checking...</span>
       </div>
       <div class="status-pill" id="swap-pill">
         <span>Swap: 0.0 GB</span>
@@ -768,7 +877,7 @@ INDEX_HTML = """<!DOCTYPE html>
   </header>
 
   <main>
-    <!-- Left: Generation Controls -->
+    <!-- Left: Generation Controls & Prompt Queue -->
     <div class="glass-card">
       <div class="card-title">
         <span>✨ 提示詞與生成設定</span>
@@ -776,7 +885,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
       <div class="form-group">
         <label for="prompt">Prompt (提示詞)</label>
-        <textarea id="prompt" placeholder="A corgi running through a vibrant grassy field, golden hour lighting, cinematic camera movement, high detail..."></textarea>
+        <textarea id="prompt" placeholder="A corgi running through a vibrant grassy field, golden hour lighting, cinematic camera movement..."></textarea>
         <div class="chips-container">
           <span class="chip" onclick="setPrompt(this.innerText)">A golden retriever catching a frisbee on the beach, splashing ocean waves</span>
           <span class="chip" onclick="setPrompt(this.innerText)">Cyberpunk city street at night, neon reflections in puddles, flying cars</span>
@@ -806,7 +915,7 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
           <div class="duration-calc-badge">
             <span id="duration-frames-text">換算幀數: 56 幀 (約 2.33 秒)</span>
-            <span>架構上限: 15.0 秒 (362 幀)</span>
+            <span>建議安全範圍: 2.0s ~ 3.0s</span>
           </div>
         </div>
       </div>
@@ -828,41 +937,29 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Subtitles Drawer -->
-      <div class="collapsible" id="subtitle-drawer">
-        <div class="collapsible-header" onclick="toggleDrawer('subtitle-drawer', 'sub-arrow')">
-          <span>💬 影片字幕設定 (Subtitle & Caption)</span>
-          <span id="sub-arrow">▼</span>
+      <!-- Prompt Queue Drawer -->
+      <div class="collapsible" id="queue-drawer">
+        <div class="collapsible-header" onclick="toggleDrawer('queue-drawer', 'queue-arrow')">
+          <span style="display:flex; align-items:center; gap:0.5rem;">
+            <span>📋 提示詞排程隊列 (Prompt Queue)</span>
+            <span class="badge-status queued" id="queue-count-badge">0 筆待處理</span>
+          </span>
+          <span id="queue-arrow">▼</span>
         </div>
         <div class="collapsible-content">
           <div class="form-group">
-            <label for="sub-text">字幕文字內容 (留空代表不加字幕)</label>
-            <input type="text" id="sub-text" placeholder="例如：奔跑在陽光草地上的柯基犬...">
-            <div class="chips-container" style="margin-top:0.25rem;">
-              <span class="chip" onclick="copyPromptToSubtitle()">📋 複製提示詞為字幕</span>
-              <span class="chip" onclick="document.getElementById('sub-text').value=''">❌ 清空字幕</span>
+            <label>批次新增提示詞 (一行一筆，支援一次貼入 5~20 筆)</label>
+            <textarea id="batch-prompts-input" placeholder="Prompt 1: A white cat playing piano in jazz club&#10;Prompt 2: A sports car drifting in mountain pass&#10;Prompt 3: Cyberpunk ramen shop with neon signs&#10;Prompt 4: An astronaut floating in colorful nebula&#10;Prompt 5: Cute corgi surfing on ocean waves" style="min-height:90px;"></textarea>
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <button class="btn-secondary" style="padding:0.45rem 0.85rem;" onclick="addBatchToQueue()">➕ 加入排程隊列</button>
+              <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; font-size:0.8rem;">
+                <input type="checkbox" id="auto-queue-chk" onchange="toggleAutoQueue(this.checked)" checked>
+                <span>🔁 自動連續生成 (Auto Queue)</span>
+              </label>
             </div>
           </div>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
-            <div class="form-group">
-              <label for="sub-style">字幕樣式</label>
-              <select id="sub-style">
-                <option value="box" selected>🔳 半透明黑底框 (清晰推薦)</option>
-                <option value="stroke">🔲 經典白字黑邊 (Classic)</option>
-                <option value="yellow">🟨 高對比亮黃 (High-Vis)</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label for="sub-pos">字幕位置</label>
-              <select id="sub-pos">
-                <option value="bottom" selected>⬇️ 底部置中 (Bottom)</option>
-                <option value="top">⬆️ 頂部置中 (Top)</option>
-              </select>
-            </div>
-          </div>
-          <div class="form-group">
-            <label for="sub-size">字體大小: <span id="sub-size-val" style="color:#6366f1;">24px</span></label>
-            <input type="range" id="sub-size" min="16" max="36" step="2" value="24" oninput="document.getElementById('sub-size-val').innerText=this.value+'px'">
+          <div class="queue-list" id="queue-items-container">
+            <p style="color:var(--text-muted); font-size:0.8rem;">目前排程隊列為空。</p>
           </div>
         </div>
       </div>
@@ -876,11 +973,11 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="collapsible-content">
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
             <div class="form-group">
-              <label for="width">寬度 (Width, 16倍數)</label>
+              <label for="width">寬度 (Width)</label>
               <input type="number" id="width" value="768" step="16" min="128" max="1344">
             </div>
             <div class="form-group">
-              <label for="height">高度 (Height, 16倍數)</label>
+              <label for="height">高度 (Height)</label>
               <input type="number" id="height" value="448" step="16" min="128" max="1344">
             </div>
           </div>
@@ -894,17 +991,23 @@ INDEX_HTML = """<!DOCTYPE html>
               <input type="number" id="seed" value="-1">
             </div>
           </div>
-          <p style="font-size:0.75rem; color:var(--text-muted);">
-            💡 註：MiniMax-H3 為 CFG-distilled 擴散架構，已將引導蒸餾至權重中，無需輸入 Negative Prompt。
-          </p>
         </div>
       </div>
 
-      <button class="btn-generate" id="btn-gen" onclick="startGenerate()">
-        <span id="btn-icon">🚀</span>
-        <span id="btn-text">開始生成 (Generate)</span>
-      </button>
+      <!-- Action Buttons -->
+      <div class="btn-row">
+        <button class="btn-generate" id="btn-gen" onclick="startGenerateStandalone()">
+          <span>🚀 開始生成 (Generate)</span>
+        </button>
+        <button class="btn-secondary" id="btn-add-single-queue" onclick="addSinglePromptToQueue()" title="加入排程稍後生成">
+          <span>➕ 加到排程</span>
+        </button>
+        <button class="btn-cancel" id="btn-cancel" onclick="cancelCurrentGeneration()">
+          <span>🛑 中止生成 (Cancel)</span>
+        </button>
+      </div>
 
+      <!-- Progress Box -->
       <div class="progress-box" id="progress-box">
         <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
           <span class="stage-text" id="stage-text">Preparing...</span>
@@ -919,15 +1022,15 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Right: Result Showcase & Live Output -->
+    <!-- Right: Result Showcase, Player & Post-Processing Subtitle Editor -->
     <div class="glass-card">
       <div class="card-title">
-        <span>🎬 生成結果與播放器</span>
+        <span>🎬 影片播放與後期編輯</span>
       </div>
 
       <div class="player-container" id="player-wrap">
         <div class="empty-state" id="empty-state">
-          點擊「開始生成」後，影片將即時在此播放
+          點擊「開始生成」或執行排程後，影片將在此播放
         </div>
         <video id="video-player" controls style="display:none;"></video>
       </div>
@@ -953,6 +1056,62 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- Post-Processing Subtitle Editor Drawer -->
+      <div class="collapsible open" id="sub-editor-drawer" style="display:none;">
+        <div class="collapsible-header" onclick="toggleDrawer('sub-editor-drawer', 'sub-edit-arrow')">
+          <span>💬 後期字幕編輯 (Subtitle & Caption Editor)</span>
+          <span id="sub-edit-arrow">▲</span>
+        </div>
+        <div class="collapsible-content">
+          <div class="form-group">
+            <label for="sub-text">字幕文字內容</label>
+            <input type="text" id="sub-text" placeholder="輸入要顯示在此時間區間的字幕...">
+          </div>
+          <!-- Time Range Selectors -->
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
+            <div class="form-group">
+              <label>開始時間 (秒)</label>
+              <div style="display:flex; gap:0.35rem;">
+                <input type="number" id="sub-start-sec" min="0.0" step="0.1" value="0.0" style="flex:1;">
+                <button class="btn-secondary" style="padding:0.4rem 0.6rem; font-size:0.75rem;" onclick="captureCurrentVideoTime('start')" title="設定為影片當前播放秒數">📍 抓取當前</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>結束時間 (秒)</label>
+              <div style="display:flex; gap:0.35rem;">
+                <input type="number" id="sub-end-sec" min="0.1" step="0.1" value="3.0" style="flex:1;">
+                <button class="btn-secondary" style="padding:0.4rem 0.6rem; font-size:0.75rem;" onclick="captureCurrentVideoTime('end')" title="設定為影片當前播放秒數">📍 抓取當前</button>
+              </div>
+            </div>
+          </div>
+          <!-- Style & Position Controls -->
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
+            <div class="form-group">
+              <label for="sub-style">字幕樣式</label>
+              <select id="sub-style">
+                <option value="box" selected>🔳 半透明黑底框 (清晰推薦)</option>
+                <option value="stroke">🔲 經典白字黑邊 (Classic)</option>
+                <option value="yellow">🟨 高對比亮黃 (High-Vis)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="sub-pos">字幕位置</label>
+              <select id="sub-pos">
+                <option value="bottom" selected>⬇️ 底部置中 (Bottom)</option>
+                <option value="top">⬆️ 頂部置中 (Top)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="sub-size">字體大小: <span id="sub-size-val" style="color:#6366f1;">26px</span></label>
+            <input type="range" id="sub-size" min="16" max="36" step="2" value="26" oninput="document.getElementById('sub-size-val').innerText=this.value+'px'">
+          </div>
+          <button class="btn-secondary" id="btn-burn-sub" style="background:var(--primary-gradient); color:white; border:none; padding:0.75rem; font-size:0.95rem; font-weight:700;" onclick="burnSubtitlesToCurrentVideo()">
+            <span>💾 另存為帶字幕新影片 (Save Subtitled Video)</span>
+          </button>
+        </div>
+      </div>
+
       <div class="metadata-grid" id="meta-grid" style="display:none;">
         <div class="meta-card">
           <div class="meta-label">解析度</div>
@@ -960,7 +1119,7 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
         <div class="meta-card">
           <div class="meta-label">長度 / 幀數</div>
-          <div class="meta-val" id="meta-dur">2.0s (16f)</div>
+          <div class="meta-val" id="meta-dur">2.0s (56f)</div>
         </div>
         <div class="meta-card">
           <div class="meta-label">Seed</div>
@@ -976,14 +1135,14 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
         <div class="meta-card">
           <div class="meta-label">Peak Memory</div>
-          <div class="meta-val" id="meta-mem">21.8 GB</div>
+          <div class="meta-val" id="meta-mem">27.0 GB</div>
         </div>
       </div>
 
-      <div class="action-row" id="action-row" style="display:none;">
-        <button class="btn-secondary" onclick="openOutputFolder()">📂 開啟所在資料夾</button>
-        <button class="btn-secondary" onclick="copyFilePath()">📋 複製檔案路徑</button>
-        <a class="btn-secondary" id="download-link" download>⬇️ 下載 MP4</a>
+      <div class="action-row" id="action-row" style="display:none; display:flex; gap:0.75rem;">
+        <button class="btn-secondary" style="flex:1;" onclick="openOutputFolder()">📂 開啟所在資料夾</button>
+        <button class="btn-secondary" style="flex:1;" onclick="copyFilePath()">📋 複製檔案路徑</button>
+        <a class="btn-secondary" id="download-link" style="flex:1;" download>⬇️ 下載 MP4</a>
       </div>
     </div>
 
@@ -1003,13 +1162,8 @@ INDEX_HTML = """<!DOCTYPE html>
   <script>
     let currentResult = null;
     let lastToastError = null;
-    let playMode = 'single'; // default: single play
-    let serverPaths = {
-      default: '',
-      desktop: '',
-      downloads: '',
-      movies: ''
-    };
+    let playMode = 'single';
+    let serverPaths = { default: '', desktop: '', downloads: '', movies: '' };
 
     function showToast(msg, duration=3500) {
       const toast = document.getElementById('toast');
@@ -1018,13 +1172,7 @@ INDEX_HTML = """<!DOCTYPE html>
       setTimeout(() => { toast.style.display = 'none'; }, duration);
     }
 
-    function setPrompt(text) {
-      document.getElementById('prompt').value = text;
-    }
-
-    function copyPromptToSubtitle() {
-      document.getElementById('sub-text').value = document.getElementById('prompt').value.trim();
-    }
+    function setPrompt(text) { document.getElementById('prompt').value = text; }
 
     function toggleDrawer(drawerId, arrowId) {
       const drawer = document.getElementById(drawerId);
@@ -1051,12 +1199,21 @@ INDEX_HTML = """<!DOCTYPE html>
       player.play().catch(()=>{});
     }
 
+    function captureCurrentVideoTime(target) {
+      const player = document.getElementById('video-player');
+      const timeVal = (player && !isNaN(player.currentTime)) ? player.currentTime.toFixed(1) : "0.0";
+      if (target === 'start') {
+        document.getElementById('sub-start-sec').value = timeVal;
+      } else {
+        document.getElementById('sub-end-sec').value = timeVal;
+      }
+      showToast(`已設定${target === 'start' ? '開始' : '結束'}時間為 ${timeVal} 秒`, 1500);
+    }
+
     function alignFrameCount(rawSec) {
       const rawFrames = Math.max(5, Math.floor(rawSec * 24));
       let aligned = rawFrames;
-      while (aligned % 17 !== 5) {
-        aligned++;
-      }
+      while (aligned % 17 !== 5) { aligned++; }
       aligned = Math.min(aligned, 362);
       const actualSec = (aligned / 24).toFixed(2);
       return { frames: aligned, sec: actualSec };
@@ -1067,6 +1224,9 @@ INDEX_HTML = """<!DOCTYPE html>
       const clamped = Math.max(0.5, Math.min(15.0, num));
       const info = alignFrameCount(clamped);
       document.getElementById('duration-frames-text').innerText = `換算幀數: ${info.frames} 幀 (約 ${info.sec} 秒)`;
+      if (document.getElementById('sub-end-sec')) {
+        document.getElementById('sub-end-sec').value = info.sec;
+      }
     }
 
     function onDurationNumInput(val) {
@@ -1086,7 +1246,6 @@ INDEX_HTML = """<!DOCTYPE html>
       document.querySelectorAll('#path-presets .chip').forEach(c => c.classList.remove('active'));
       const activeChip = document.getElementById('chip-' + presetKey);
       if (activeChip) activeChip.classList.add('active');
-
       const targetPath = serverPaths[presetKey] || '';
       if (targetPath) {
         document.getElementById('output-dir').value = targetPath;
@@ -1142,6 +1301,209 @@ INDEX_HTML = """<!DOCTYPE html>
       updateDurationDisplay(document.getElementById('duration-num').value);
     }
 
+    /* Queue Operations */
+    async function fetchQueue() {
+      try {
+        const res = await fetch('/api/queue');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderQueueList(data.items || []);
+        const autoChk = document.getElementById('auto-queue-chk');
+        if (autoChk && typeof data.auto_enabled === 'boolean') {
+          autoChk.checked = data.auto_enabled;
+        }
+      } catch(e) {}
+    }
+
+    function renderQueueList(items) {
+      const container = document.getElementById('queue-items-container');
+      const badge = document.getElementById('queue-count-badge');
+      const queuedCount = items.filter(i => i.status === 'queued').length;
+      badge.innerText = `${queuedCount} 筆待處理`;
+
+      if (!items || items.length === 0) {
+        container.innerHTML = '<p style="color:var(--text-muted); font-size:0.8rem;">目前排程隊列為空。</p>';
+        return;
+      }
+
+      container.innerHTML = items.map((item, idx) => {
+        const isRun = item.status === 'running';
+        const isFail = item.status === 'failed';
+        const isCancel = item.status === 'cancelled';
+        const statusMap = {
+          'queued': '⏳ 排程中',
+          'running': '▶️ 生成中',
+          'completed': '✅ 已完成',
+          'failed': '❌ 失敗',
+          'cancelled': '🛑 已取消',
+          'paused': '⏸️ 已暫停'
+        };
+        return `
+          <div class="queue-card ${item.status}">
+            <div class="queue-header">
+              <div style="display:flex; align-items:center; gap:0.4rem;">
+                <span style="color:var(--text-muted); font-family:'JetBrains Mono',monospace;">#${idx+1}</span>
+                <span class="badge-status ${item.status}">${statusMap[item.status] || item.status}</span>
+                <span style="color:var(--text-muted); font-size:0.7rem;">${item.width}x${item.height} · ${item.duration_sec}s · ${item.steps}st</span>
+              </div>
+              <div class="queue-actions">
+                ${(isFail || isCancel || item.status === 'completed') ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'retry')" title="重新排程">🔄 Retry</button>` : ''}
+                ${item.status === 'queued' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'run_now')" title="立即開始執行">⚡ 立即</button>` : ''}
+                ${item.status === 'queued' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'pause')" title="暫停">⏸️</button>` : ''}
+                ${item.status === 'paused' ? `<button class="btn-tiny" onclick="queueAction('${item.id}', 'resume')" title="恢復">▶️</button>` : ''}
+                <button class="btn-tiny" onclick="queueAction('${item.id}', 'delete')" title="刪除">🗑️</button>
+              </div>
+            </div>
+            <div class="queue-prompt-text">${item.prompt}</div>
+            ${item.error_message ? `<div style="font-size:0.75rem; color:#f87171; background:rgba(239,68,68,0.1); padding:0.25rem 0.5rem; border-radius:4px;">${item.error_message}</div>` : ''}
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function addBatchToQueue() {
+      const text = document.getElementById('batch-prompts-input').value.trim();
+      if (!text) {
+        showToast("請在上方文字框輸入提示詞 (一行一筆)");
+        return;
+      }
+      const profile = document.getElementById('profile').value;
+      const width = parseInt(document.getElementById('width').value, 10) || 768;
+      const height = parseInt(document.getElementById('height').value, 10) || 448;
+      const duration_sec = parseFloat(document.getElementById('duration-num').value) || 2.0;
+      const steps = parseInt(document.getElementById('steps').value, 10) || 10;
+      const seed = parseInt(document.getElementById('seed').value, 10);
+      const output_dir = document.getElementById('output-dir').value.trim();
+
+      try {
+        const res = await fetch('/api/queue/batch-add', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ prompts_text: text, profile, width, height, duration_sec, steps, seed, output_dir })
+        });
+        if (res.ok) {
+          document.getElementById('batch-prompts-input').value = '';
+          const data = await res.json();
+          renderQueueList(data.items || []);
+          showToast(`已成功加入 ${data.added_count} 筆提示詞至排程！`);
+        }
+      } catch(e) { showToast("加入排程失敗"); }
+    }
+
+    async function addSinglePromptToQueue() {
+      const prompt = document.getElementById('prompt').value.trim();
+      if (!prompt) { showToast("請輸入提示詞 (Prompt)"); return; }
+      const profile = document.getElementById('profile').value;
+      const width = parseInt(document.getElementById('width').value, 10) || 768;
+      const height = parseInt(document.getElementById('height').value, 10) || 448;
+      const duration_sec = parseFloat(document.getElementById('duration-num').value) || 2.0;
+      const steps = parseInt(document.getElementById('steps').value, 10) || 10;
+      const seed = parseInt(document.getElementById('seed').value, 10);
+      const output_dir = document.getElementById('output-dir').value.trim();
+
+      try {
+        const res = await fetch('/api/queue/batch-add', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ prompts_text: prompt, profile, width, height, duration_sec, steps, seed, output_dir })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          renderQueueList(data.items || []);
+          showToast("已加入排程隊列！");
+        }
+      } catch(e) {}
+    }
+
+    async function queueAction(itemId, action) {
+      try {
+        const res = await fetch('/api/queue/action', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ item_id: itemId, action })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          renderQueueList(data.items || []);
+          syncJobState();
+        } else {
+          const err = await res.json();
+          showToast(err.detail || "操作失敗");
+        }
+      } catch(e) {}
+    }
+
+    async function toggleAutoQueue(enabled) {
+      try {
+        await fetch('/api/queue/toggle-auto', { method: 'POST' });
+        showToast(enabled ? "已啟用自動連續排程生成" : "已暫停自動連續生成");
+      } catch(e) {}
+    }
+
+    /* Subtitle Burn-In */
+    async function burnSubtitlesToCurrentVideo() {
+      if (!currentResult || (!currentResult.output_path && !currentResult.output_filename)) {
+        showToast("請先選擇或生成一部影片進行後期字幕編輯");
+        return;
+      }
+      const text = document.getElementById('sub-text').value.trim();
+      if (!text) {
+        showToast("請輸入字幕文字內容");
+        return;
+      }
+      const videoPath = currentResult.output_path || (serverPaths.default + '/' + currentResult.output_filename);
+      const startSec = parseFloat(document.getElementById('sub-start-sec').value) || 0.0;
+      const endSec = parseFloat(document.getElementById('sub-end-sec').value) || null;
+      const style = document.getElementById('sub-style').value;
+      const position = document.getElementById('sub-pos').value;
+      const fontSize = parseInt(document.getElementById('sub-size').value, 10) || 26;
+
+      const btn = document.getElementById('btn-burn-sub');
+      btn.disabled = true;
+      btn.innerHTML = '<span>⏳ 正在快速壓制字幕... (約 1~2 秒)</span>';
+
+      try {
+        const res = await fetch('/api/subtitles/burn', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            video_path: videoPath,
+            text, start_sec: startSec, end_sec: endSec,
+            style, position, font_size: fontSize
+          })
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          showToast("字幕壓制失敗: " + (err.detail || "未知錯誤"));
+          return;
+        }
+        const data = await res.json();
+        showToast("✨ 帶字幕新影片另存成功！");
+        // Switch player to newly subtitled video
+        const newResult = Object.assign({}, currentResult, {
+          output_path: data.output_path,
+          output_filename: data.output_filename
+        });
+        displayResult(newResult);
+        fetchHistory();
+      } catch (e) {
+        showToast("壓制失敗，請確認檔案路徑");
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span>💾 另存為帶字幕新影片 (Save Subtitled Video)</span>';
+      }
+    }
+
+    async function cancelCurrentGeneration() {
+      try {
+        const btn = document.getElementById('btn-cancel');
+        btn.innerText = '中止中... (Cancelling)';
+        btn.disabled = true;
+        await fetch('/api/generate/cancel', { method: 'POST' });
+        showToast("已發送中止訊號，正在釋放 Metal 記憶體...");
+      } catch(e) {}
+    }
+
     async function fetchStatus() {
       try {
         const res = await fetch('/api/status');
@@ -1181,9 +1543,6 @@ INDEX_HTML = """<!DOCTYPE html>
 
         if (job.is_running) {
           showRunning(job);
-          if (job.prompt && !document.getElementById('prompt').value) {
-            document.getElementById('prompt').value = job.prompt;
-          }
         } else {
           showIdle();
           if (job.result) {
@@ -1194,7 +1553,7 @@ INDEX_HTML = """<!DOCTYPE html>
           } else if (job.error) {
             if (lastToastError !== job.error) {
               lastToastError = job.error;
-              showToast("生成失敗: " + job.error);
+              showToast("任務中斷: " + job.error);
             }
           }
         }
@@ -1226,9 +1585,7 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
         `}).join('');
         return items;
-      } catch (e) {
-        return [];
-      }
+      } catch (e) { return []; }
     }
 
     function loadHistoryItem(item) {
@@ -1241,11 +1598,13 @@ INDEX_HTML = """<!DOCTYPE html>
       const player = document.getElementById('video-player');
       const empty = document.getElementById('empty-state');
       const toolbar = document.getElementById('player-toolbar');
+      const subDrawer = document.getElementById('sub-editor-drawer');
+
       empty.style.display = 'none';
       player.style.display = 'block';
       toolbar.style.display = 'flex';
+      subDrawer.style.display = 'block';
 
-      // Set default single playback mode
       player.loop = (playMode === 'loop');
       player.playbackRate = parseFloat(document.getElementById('play-speed').value) || 1.0;
 
@@ -1262,14 +1621,24 @@ INDEX_HTML = """<!DOCTYPE html>
       document.getElementById('meta-time').innerText = (res.execution_time_sec / 60).toFixed(1) + ' min';
       document.getElementById('meta-mem').innerText = (res.peak_memory_gib || '27.0') + ' GB';
 
+      // Set default subtitle end time to match duration
+      if (res.duration_sec) {
+        document.getElementById('sub-end-sec').value = res.duration_sec;
+      }
+
       document.getElementById('meta-grid').style.display = 'grid';
       document.getElementById('action-row').style.display = 'flex';
       document.getElementById('download-link').href = videoUrl;
     }
 
     function showRunning(job) {
-      document.getElementById('btn-gen').disabled = true;
-      document.getElementById('btn-text').innerText = '生成中... (Generating)';
+      document.getElementById('btn-gen').style.display = 'none';
+      document.getElementById('btn-add-single-queue').style.display = 'none';
+      const cancelBtn = document.getElementById('btn-cancel');
+      cancelBtn.style.display = 'flex';
+      cancelBtn.disabled = false;
+      cancelBtn.innerHTML = '<span>🛑 中止生成 (Cancel)</span>';
+
       document.getElementById('progress-box').style.display = 'flex';
       document.getElementById('stage-text').innerText = job.stage || 'Processing...';
       const pct = Math.min(100, Math.max(5, (job.progress * 100)));
@@ -1286,17 +1655,15 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     function showIdle() {
-      document.getElementById('btn-gen').disabled = false;
-      document.getElementById('btn-text').innerText = '開始生成 (Generate)';
+      document.getElementById('btn-gen').style.display = 'flex';
+      document.getElementById('btn-add-single-queue').style.display = 'flex';
+      document.getElementById('btn-cancel').style.display = 'none';
       document.getElementById('progress-box').style.display = 'none';
     }
 
-    async function startGenerate() {
+    async function startGenerateStandalone() {
       const prompt = document.getElementById('prompt').value.trim();
-      if (!prompt) {
-        showToast("請輸入提示詞 (Prompt)");
-        return;
-      }
+      if (!prompt) { showToast("請輸入提示詞 (Prompt)"); return; }
       const profile = document.getElementById('profile').value;
       const width = parseInt(document.getElementById('width').value, 10) || 768;
       const height = parseInt(document.getElementById('height').value, 10) || 448;
@@ -1305,27 +1672,17 @@ INDEX_HTML = """<!DOCTYPE html>
       const seed = parseInt(document.getElementById('seed').value, 10);
       const output_dir = document.getElementById('output-dir').value.trim();
 
-      // Subtitle parameters
-      const subtitle_text = document.getElementById('sub-text').value.trim();
-      const subtitle_style = document.getElementById('sub-style').value;
-      const subtitle_position = document.getElementById('sub-pos').value;
-      const subtitle_font_size = parseInt(document.getElementById('sub-size').value, 10) || 24;
-
       try {
         const res = await fetch('/api/generate', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({
-            prompt, profile, width, height, duration_sec, steps, seed, output_dir,
-            subtitle_text, subtitle_style, subtitle_position, subtitle_font_size
-          })
+          body: JSON.stringify({ prompt, profile, width, height, duration_sec, steps, seed, output_dir })
         });
         if (!res.ok) {
           const err = await res.json();
           showToast("啟動失敗: " + (err.detail || "未知錯誤"));
           return;
         }
-
         lastToastError = null;
         showRunning({stage: 'Starting generation...', progress: 0.05, elapsed_sec: 0});
         syncJobState();
@@ -1363,12 +1720,14 @@ INDEX_HTML = """<!DOCTYPE html>
     async function initApp() {
       updateDurationDisplay(2.0);
       await fetchStatus();
+      await fetchQueue();
       await syncJobState();
       const historyList = await fetchHistory();
       if (!currentResult && historyList && historyList.length > 0 && historyList[0].output_filename) {
         displayResult(historyList[0]);
       }
       setInterval(syncJobState, 1500);
+      setInterval(fetchQueue, 2500);
       setInterval(fetchStatus, 4000);
     }
 
@@ -1389,7 +1748,7 @@ def start_server(port: int | None = None, open_browser: bool = True):
     url = f"http://127.0.0.1:{actual_port}"
 
     print("\n" + "=" * 60)
-    print("🎬 MiniMax-H3 Local Web Studio")
+    print("🎬 MiniMax-H3 Local Web Studio (with Prompt Queue & Subtitle Editor)")
     print(f"URL: {url}")
     print("=" * 60 + "\n", flush=True)
 

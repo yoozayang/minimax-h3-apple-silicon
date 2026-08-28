@@ -7,8 +7,10 @@ import gc
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -219,6 +221,190 @@ def write_srt_file(srt_path: str | Path, text: str, duration_sec: float) -> None
         print(f"Warning: Failed to write SRT file: {e}", file=sys.stderr)
 
 
+def burn_subtitles_to_video(
+    input_path: str | Path,
+    output_path: str | Path | None = None,
+    subtitles: list[dict] | None = None,
+    text: str = "",
+    start_sec: float = 0.0,
+    end_sec: float | None = None,
+    position: str = "bottom",
+    style: str = "box",
+    font_size: int = 24,
+) -> str:
+    """Post-processing subtitle burn-in onto an existing video file without MLX re-rendering."""
+    input_path = Path(input_path).expanduser().resolve()
+    if not input_path.exists() or not input_path.is_file():
+        raise FileNotFoundError(f"Video file not found: {input_path}")
+
+    # Determine destination path
+    if output_path is None:
+        destination = input_path.parent / f"{input_path.stem}_subtitled{input_path.suffix}"
+    else:
+        destination = Path(output_path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    # Format subtitles list
+    sub_list = []
+    if subtitles:
+        sub_list = subtitles
+    elif text and text.strip():
+        sub_list = [{
+            "start_sec": max(0.0, float(start_sec)),
+            "end_sec": float(end_sec) if (end_sec is not None and float(end_sec) > 0) else 999999.0,
+            "text": text.strip(),
+            "position": position,
+            "style": style,
+            "font_size": int(font_size),
+        }]
+
+    if not sub_list:
+        shutil.copy2(input_path, destination)
+        return str(destination)
+
+    # Get video metadata via ffprobe
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe is required for subtitle post-processing")
+    cmd = [
+        ffprobe, "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", str(input_path)
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(res.stdout)
+    v_stream = next(s for s in data["streams"] if s["codec_type"] == "video")
+    w = int(v_stream["width"])
+    h = int(v_stream["height"])
+    fps_parts = v_stream["r_frame_rate"].split("/")
+    fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) > 1 else float(fps_parts[0])
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for subtitle post-processing")
+
+    # Read raw RGB frames from input video
+    read_cmd = [
+        ffmpeg, "-y", "-i", str(input_path),
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-"
+    ]
+    p_read = subprocess.Popen(read_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    # Write to temp output
+    temp_out = destination.parent / f".{destination.stem}_temp{destination.suffix}"
+    write_cmd = [
+        ffmpeg, "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s:v", f"{w}x{h}", "-r", str(fps), "-i", "pipe:0",
+        "-i", str(input_path),
+        "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(temp_out)
+    ]
+    p_write = subprocess.Popen(write_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    font_cache = {}
+    def get_font(size):
+        if size not in font_cache:
+            f = None
+            for fp in ["/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/Helvetica.ttc"]:
+                if Path(fp).exists():
+                    try:
+                        f = ImageFont.truetype(fp, size)
+                        break
+                    except Exception:
+                        pass
+            if f is None:
+                f = ImageFont.load_default()
+            font_cache[size] = f
+        return font_cache[size]
+
+    frame_size = w * h * 3
+    frame_idx = 0
+
+    try:
+        while True:
+            raw_frame = p_read.stdout.read(frame_size)
+            if not raw_frame or len(raw_frame) < frame_size:
+                break
+
+            current_time = frame_idx / fps
+
+            active_sub = None
+            for sub in sub_list:
+                s_sec = sub.get("start_sec", 0.0)
+                e_sec = sub.get("end_sec", 999999.0)
+                if s_sec <= current_time <= e_sec:
+                    active_sub = sub
+                    break
+
+            if active_sub and active_sub.get("text", "").strip():
+                txt = active_sub["text"].strip()
+                s_style = active_sub.get("style", "box")
+                s_pos = active_sub.get("position", "bottom")
+                s_size = active_sub.get("font_size", 24)
+                fnt = get_font(s_size)
+
+                img = Image.frombytes("RGB", (w, h), raw_frame).convert("RGBA")
+                overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
+                draw = ImageDraw.Draw(overlay)
+
+                max_w = int(w * 0.90)
+                raw_lines = txt.split("\n")
+                lines = []
+                for raw_l in raw_lines:
+                    line = ""
+                    for ch in raw_l:
+                        test_line = line + ch
+                        bbox = draw.textbbox((0, 0), test_line, font=fnt)
+                        if bbox[2] - bbox[0] > max_w and line:
+                            lines.append(line)
+                            line = ch
+                        else:
+                            line = test_line
+                    if line:
+                        lines.append(line)
+
+                line_height = int(s_size * 1.3)
+                total_text_h = len(lines) * line_height
+                start_y = int(h * 0.08) if s_pos == "top" else h - total_text_h - int(h * 0.08)
+
+                text_color = (255, 255, 255)
+                stroke_color = (0, 0, 0)
+                stroke_w = max(1, s_size // 10)
+                box_bg = (0, 0, 0, 160)
+                if s_style == "yellow":
+                    text_color = (255, 235, 59)
+                elif s_style == "stroke":
+                    box_bg = None
+
+                for j, line_str in enumerate(lines):
+                    bbox = draw.textbbox((0, 0), line_str, font=fnt)
+                    lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    lx = (w - lw) // 2
+                    ly = start_y + j * line_height
+                    if box_bg:
+                        pad = int(s_size * 0.35)
+                        draw.rounded_rectangle([lx - pad, ly - pad // 2, lx + lw + pad, ly + lh + pad // 2], radius=6, fill=box_bg)
+                    draw.text((lx, ly), line_str, font=fnt, fill=text_color + (255,), stroke_width=stroke_w, stroke_fill=stroke_color + (255,))
+
+                final_img = Image.alpha_composite(img, overlay).convert("RGB")
+                p_write.stdin.write(final_img.tobytes())
+            else:
+                p_write.stdin.write(raw_frame)
+
+            frame_idx += 1
+    finally:
+        p_write.stdin.close()
+        p_read.wait()
+        p_write.wait()
+
+    temp_out.replace(destination)
+    return str(destination)
+
+
 def render_subtitles_on_frames(
     frames: mx.array,
     text: str,
@@ -347,6 +533,7 @@ def generate_video(
     steps: int | None = None,
     on_stage: Callable[[str, float], None] | None = None,
     output_dir: str | Path | None = None,
+    cancel_event: threading.Event | None = None,
     subtitle_text: str | None = None,
     subtitle_position: str = "bottom",
     subtitle_style: str = "box",
@@ -375,6 +562,9 @@ def generate_video(
     if not prompt or not prompt.strip():
         raise ValueError("Prompt cannot be empty.")
 
+    if cancel_event and cancel_event.is_set():
+        raise InterruptedError("Generation task was cancelled by user.")
+
     # Clean previous memory footprint
     gc.collect()
     memory.release()
@@ -392,6 +582,8 @@ def generate_video(
     actual_steps = paths.sampling_profile.resolve_steps(steps)
 
     def report_stage(stage_text: str, progress: float):
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation task was cancelled by user.")
         if on_stage:
             on_stage(stage_text, progress)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {stage_text}", flush=True)
@@ -400,7 +592,7 @@ def generate_video(
     paths.validate(ref2va=False)
 
     memory.configure(budget_gib=28)
-    guard = memory.Guard("generate", budget_gib=28)
+    guard = memory.Guard("generate", budget_gib=28, cancel_check=lambda: bool(cancel_event and cancel_event.is_set()))
 
     started_time = time.perf_counter()
     time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -423,6 +615,8 @@ def generate_video(
     peak_memory_bytes = 0
 
     def on_phase_report(item: pipeline.PhaseReport):
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation task was cancelled by user.")
         nonlocal peak_memory_bytes
         if item.peak > peak_memory_bytes:
             peak_memory_bytes = item.peak
@@ -439,7 +633,7 @@ def generate_video(
             )
         elif "video" in item.label.lower():
             report_stage(
-                f"[4/4] 視訊解碼完成！正在進行音訊解碼與字幕封裝...",
+                f"[4/4] 視訊解碼完成！正在進行音訊解碼與 MP4 封裝...",
                 0.90,
             )
         else:
@@ -449,6 +643,8 @@ def generate_video(
             )
 
     def on_step_progress(done: int, total: int, sigma_video: float, sigma_audio: float):
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation task was cancelled by user.")
         pct = done / total
         progress = 0.15 + pct * 0.65
         est_min_left = max(0, round((total - done) * 1.9, 1))
@@ -466,6 +662,9 @@ def generate_video(
             on_step=on_step_progress,
             on_report=on_phase_report,
         )
+
+        if cancel_event and cancel_event.is_set():
+            raise InterruptedError("Generation task was cancelled by user.")
 
         # Process subtitles if provided
         final_frames = media_result.frames

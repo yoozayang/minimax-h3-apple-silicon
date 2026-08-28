@@ -118,11 +118,14 @@ def configure(budget_gib: int = BUDGET_GIB) -> None:
 class Guard:
     """Telemetry and safety guard for phased execution."""
 
-    def __init__(self, label: str, budget_gib: int = BUDGET_GIB):
+    def __init__(self, label: str, budget_gib: int = BUDGET_GIB, cancel_check: Callable[[], bool] | None = None):
         self.label = label
         self.base = sample()
+        self.cancel_check = cancel_check
 
     def check(self, note: str = "") -> Sample:
+        if self.cancel_check and self.cancel_check():
+            raise InterruptedError("Generation task was cancelled by user.")
         return sample()
 
     def __enter__(self) -> Guard:
