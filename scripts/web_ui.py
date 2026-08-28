@@ -137,6 +137,7 @@ class ImageGenerateRequest(BaseModel):
     model_name: str = "flux2-klein-4b"
     quantize: int = 4
     count: int = 1
+    output_dir: str | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -503,6 +504,7 @@ async def generate_image_endpoint(req: ImageGenerateRequest):
             model_name=req.model_name,
             quantize=req.quantize,
             count=req.count,
+            output_dir=req.output_dir,
             progress_callback=on_img_prog,
             cancel_check=lambda: cancel_ev.is_set(),
         )
@@ -1315,6 +1317,23 @@ INDEX_HTML = """<!DOCTYPE html>
                   <input type="number" id="custom-steps" value="10" min="4" max="60" />
                 </div>
               </div>
+
+              <!-- Output Directory Selector -->
+              <div class="form-group" style="margin-top:0.4rem; padding-top:0.6rem; border-top:1px solid rgba(255,255,255,0.06);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.3rem;">
+                  <label style="margin-bottom:0; color:var(--text-main); font-weight:600;">📁 產出儲存位置 (Output Folder)</label>
+                  <button class="btn-tiny" onclick="openCurrentFolder()" title="在 Finder 中開啟此資料夾">📂 在 Finder 開啟</button>
+                </div>
+                <div style="display:flex; gap:0.4rem; align-items:center;">
+                  <input type="text" id="output-dir" class="path-input" placeholder="/Users/.../outputs" onchange="saveOutputDir(this.value)" style="flex:1; font-family:'JetBrains Mono',monospace; font-size:0.75rem; padding:0.45rem 0.65rem; border-radius:6px; background:rgba(0,0,0,0.3); border:1px solid var(--card-border); color:var(--text-main);" />
+                </div>
+                <div class="chips-container" id="path-presets" style="margin-top:0.4rem; flex-wrap:wrap;">
+                  <span class="chip active" id="chip-default" onclick="selectPathPreset('default')">📁 專案預設 (outputs)</span>
+                  <span class="chip" id="chip-desktop" onclick="selectPathPreset('desktop')">🖥️ 桌面 (Desktop)</span>
+                  <span class="chip" id="chip-downloads" onclick="selectPathPreset('downloads')">📥 下載 (Downloads)</span>
+                  <span class="chip" id="chip-movies" onclick="selectPathPreset('movies')">🎬 影片 (Movies)</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1443,12 +1462,42 @@ INDEX_HTML = """<!DOCTYPE html>
     let currentVideoMode = 'text';
     let historyViewMode = localStorage.getItem('minimax_history_view') || 'grid';
     let hiddenHistoryKeys = JSON.parse(localStorage.getItem('minimax_hidden_history') || '[]');
+    let serverPaths = {};
 
     function showToast(msg, duration = 3000) {
       const toast = document.getElementById('toast');
       toast.innerText = msg;
       toast.style.display = 'block';
       setTimeout(() => { toast.style.display = 'none'; }, duration);
+    }
+
+    function selectPathPreset(presetKey) {
+      document.querySelectorAll('#path-presets .chip').forEach(c => c.classList.remove('active'));
+      const activeChip = document.getElementById('chip-' + presetKey);
+      if (activeChip) activeChip.classList.add('active');
+      const targetPath = serverPaths[presetKey] || '';
+      if (targetPath) {
+        document.getElementById('output-dir').value = targetPath;
+        localStorage.setItem('minimax_output_dir', targetPath);
+      }
+    }
+
+    function saveOutputDir(val) {
+      localStorage.setItem('minimax_output_dir', val.trim());
+      document.querySelectorAll('#path-presets .chip').forEach(c => c.classList.remove('active'));
+      if (val === serverPaths.default) document.getElementById('chip-default')?.classList.add('active');
+      else if (val === serverPaths.desktop) document.getElementById('chip-desktop')?.classList.add('active');
+      else if (val === serverPaths.downloads) document.getElementById('chip-downloads')?.classList.add('active');
+      else if (val === serverPaths.movies) document.getElementById('chip-movies')?.classList.add('active');
+    }
+
+    function openCurrentFolder() {
+      const dir = (document.getElementById('output-dir')?.value || '').trim();
+      fetch('/api/open-folder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({dir_path: dir})
+      });
     }
 
     function toggleCollapsible(el) {
@@ -1549,6 +1598,7 @@ INDEX_HTML = """<!DOCTYPE html>
         showToast('⚠️ 請先輸入提示詞！');
         return;
       }
+      const output_dir = (document.getElementById('output-dir')?.value || '').trim();
       showToast('🎨 開始使用 MFLUX 生成圖片...');
       try {
         const res = await fetch('/api/image/generate', {
@@ -1561,7 +1611,8 @@ INDEX_HTML = """<!DOCTYPE html>
             steps: 4,
             model_name: 'flux2-klein-4b',
             quantize: 4,
-            count: 1
+            count: 1,
+            output_dir: output_dir
           })
         });
         const data = await res.json();
@@ -1604,6 +1655,7 @@ INDEX_HTML = """<!DOCTYPE html>
       const profile = document.getElementById('video-profile').value;
       const isLong = (profile === 'long');
       const targetDuration = isLong ? parseFloat(document.getElementById('long-target-duration').value || '10.0') : null;
+      const output_dir = (document.getElementById('output-dir')?.value || '').trim();
 
       const body = {
         prompt: prompt,
@@ -1617,6 +1669,7 @@ INDEX_HTML = """<!DOCTYPE html>
         references: (currentVideoMode === 'reference') ? currentRefSubjects : null,
         long_mode: isLong,
         target_duration_sec: targetDuration,
+        output_dir: output_dir
       };
 
       try {
@@ -1644,6 +1697,7 @@ INDEX_HTML = """<!DOCTYPE html>
       const profile = document.getElementById('video-profile').value;
       const isLong = (profile === 'long');
       const targetDuration = isLong ? parseFloat(document.getElementById('long-target-duration').value || '10.0') : null;
+      const output_dir = (document.getElementById('output-dir')?.value || '').trim();
 
       try {
         const res = await fetch('/api/queue/batch-add', {
@@ -1659,6 +1713,7 @@ INDEX_HTML = """<!DOCTYPE html>
             mode: currentVideoMode,
             start_image: (currentVideoMode === 'image') ? currentStartImagePath : null,
             references: (currentVideoMode === 'reference') ? currentRefSubjects : null,
+            output_dir: output_dir
           })
         });
         const data = await res.json();
@@ -1963,6 +2018,24 @@ INDEX_HTML = """<!DOCTYPE html>
           const memTotalEl = document.getElementById('mem-total');
           if (memUsedEl) memUsedEl.innerText = `${used} GB`;
           if (memTotalEl) memTotalEl.innerText = `${total} GB`;
+        }
+        if (data.default_output_dir && !serverPaths.default) {
+          serverPaths.default = data.default_output_dir;
+          serverPaths.desktop = data.desktop_dir;
+          serverPaths.downloads = data.downloads_dir;
+          serverPaths.movies = data.movies_dir;
+
+          const outInput = document.getElementById('output-dir');
+          if (outInput) {
+            const saved = localStorage.getItem('minimax_output_dir');
+            if (saved) {
+              outInput.value = saved;
+              saveOutputDir(saved);
+            } else {
+              outInput.value = data.default_output_dir;
+              saveOutputDir(data.default_output_dir);
+            }
+          }
         }
       } catch (e) {}
     }

@@ -128,6 +128,7 @@ def generate_images(
     model_name: str = "flux2-klein-4b",
     quantize: int = 4,
     count: int = 1,
+    output_dir: str | Path | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> list[ImageResult]:
@@ -148,6 +149,10 @@ def generate_images(
 
     results: list[ImageResult] = []
     count = max(1, min(4, count))
+
+    # Resolve output directory
+    target_dir = Path(output_dir).expanduser().resolve() if output_dir and str(output_dir).strip() else IMAGES_OUTPUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
 
     # Normalize model_name: if user passed "schnell" without HF token, use open ungated FLUX.2-Klein-4B
     has_hf_token = bool(os.environ.get("HF_TOKEN") or os.path.exists(os.path.expanduser("~/.cache/huggingface/token")))
@@ -189,7 +194,7 @@ def generate_images(
 
         timestamp_str = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"{timestamp_str}_img_seed{current_seed}_{width}x{height}.png"
-        out_path = IMAGES_OUTPUT_DIR / filename
+        out_path = target_dir / filename
 
         try:
             generated_img = _RESIDENT_FLUX_MODEL.generate_image(
