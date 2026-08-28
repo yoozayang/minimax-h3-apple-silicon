@@ -48,9 +48,61 @@
 
 ## 🔌 圖片生成引擎外插標準介面 (Pluggable Image Engine Contract)
 
-為了實現「**替換圖片引擎完全不改動前端**」，任何圖片生成引擎只需在 `scripts/image_engine.py` 中實現下列 **2 個標準介面**：
+為了實現「**替換圖片引擎完全不改動前端**」，圖片生成模組在 `scripts/image_engine.py` 中實現下列標準協定：
 
-### 1. 核心生成函式：`generate_images(...)`
+### 1. 模型註冊表 (Model Registry)：`IMAGE_MODELS`
+
+後端統一維護模型註冊表，前端透過 `GET /api/image/models` 動態取得模型列表，不寫死前端邏輯：
+
+```python
+IMAGE_MODELS = {
+    "krea-2": {
+        "id": "krea-2",
+        "display_name": "Krea 2 Turbo — Quality",
+        "backend": "mlx_mflux",
+        "supports_t2i": True,
+        "supports_i2i": True,
+        "supports_multi_reference": True,
+        "supported_quantization": [4, 8],
+        "recommended_profiles": ["draft", "balanced", "high", "maximum"],
+        "default_profile": "high",
+        "memory_requirement": "~8-12 GB",
+        "is_default": True,
+        "description": "高品質專用模型，細節細膩、光影層次豐富",
+    },
+    "flux2-klein-4b": {
+        "id": "flux2-klein-4b",
+        "display_name": "FLUX.2 Klein 4B — Fast",
+        "backend": "mlx_mflux",
+        "supports_t2i": True,
+        "supports_i2i": True,
+        "supports_multi_reference": False,
+        "supported_quantization": [4, 8],
+        "recommended_profiles": ["draft", "balanced", "high", "maximum"],
+        "default_profile": "high",
+        "memory_requirement": "~3-5 GB",
+        "is_default": False,
+        "description": "極速備用模型，4步快速構圖",
+    },
+}
+```
+
+### 2. 非線性品質設定檔解析器：`resolve_image_profile(...)`
+
+提供 `Draft / Balanced / High / Maximum` 4 級品質設定，針對模型特性自適應最佳參數：
+
+* **Krea 2 Turbo**：
+  * `draft`：4 steps, 4-bit, 512×512, Guidance 1.0 (極速構圖)
+  * `balanced`：6 steps, 4-bit, 768×768, Guidance 1.0 (效率平衡)
+  * `high` (Default)：8 steps, 4-bit, 1024×1024, Guidance 1.0 (高品質正式產出)
+  * `maximum`：12 steps, 8-bit, 1024×1024, Guidance 1.0 (極致畫質，精度優先)
+* **FLUX.2 Klein 4B**：
+  * `draft`：2 steps, 4-bit, 512×512
+  * `balanced`：4 steps, 4-bit, 768×768
+  * `high` (Default)：4 steps, 4-bit, 1024×1024
+  * `maximum`：8 steps, 4-bit, 1024×1024
+
+### 3. 核心生成函式：`generate_images(...)`
 
 ```python
 def generate_images(
@@ -59,7 +111,8 @@ def generate_images(
     height: int = 768,
     steps: int = 4,
     seed: int = -1,
-    model_name: str = "flux2-klein-4b",
+    model_name: str = "krea-2",
+    quality_profile: str = "high",
     quantize: int = 4,
     count: int = 1,
     output_dir: str | Path | None = None,
@@ -68,7 +121,7 @@ def generate_images(
 ) -> list[ImageResult]:
     """
     【標準介面契約】
-    1. 接收前端傳入之標準參數。
+    1. 接收前端傳入之標準參數與 quality_profile。
     2. 自動確保顯存安全：呼叫 model_manager.switch_to_engine("IMAGE")。
     3. 執行圖片生成邏輯（本地模型、外部 API 或 ComfyUI）。
     4. 將圖片寫入指定之 output_dir（預設 outputs/images/）。
@@ -83,11 +136,12 @@ def generate_images(
 | `prompt` | `str` | 提示詞描述（已去空白） | *(必填)* |
 | `width` | `int` | 圖片寬度（自動對齊 16 的倍數） | `768` |
 | `height` | `int` | 圖片高度（自動對齊 16 的倍數） | `768` |
-| `steps` | `int` | 採樣步數 (Inference Steps) | `4` |
+| `steps` | `int` | 採樣步數 (Inference Steps，相容舊介面) | `4` |
 | `seed` | `int` | 隨機種子（`-1` 代表隨機） | `-1` |
-| `model_name` | `str` | 模型識別名稱 | `"flux2-klein-4b"` |
+| `model_name` | `str` | 模型識別名稱 (`"krea-2"` / `"flux2-klein-4b"`) | `"krea-2"` |
+| `quality_profile`| `str` | 品質檔位 (`"draft"` / `"balanced"` / `"high"` / `"maximum"`) | `"high"` |
 | `quantize` | `int` | MLX 量化位元 (4 或 8) | `4` |
-| `count` | `int` | 生成張數 (1 ~ 4) | `1` |
+| `count` | `int` | 生成張數 (1 ~ 4，循序生成避免 OOM) | `1` |
 | `output_dir` | `str \| None` | 儲存目標資料夾（若無則使用 outputs/images/） | `None` |
 | `progress_callback` | `Callable` | 進度回報回呼：`callback(progress_float_0_to_1, stage_text)` | `None` |
 | `cancel_check` | `Callable` | 中斷檢查函式：若回傳 `True` 則安全退出迴圈 | `None` |

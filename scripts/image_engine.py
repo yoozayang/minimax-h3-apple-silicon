@@ -119,20 +119,195 @@ def get_image_history(limit: int = 40) -> list[dict]:
         return []
 
 
+# Registry of available image generation models
+IMAGE_MODELS: dict[str, dict[str, Any]] = {
+    "krea-2": {
+        "id": "krea-2",
+        "display_name": "Krea 2 Turbo — Quality",
+        "backend": "mlx_mflux",
+        "supports_t2i": True,
+        "supports_i2i": True,
+        "supports_multi_reference": True,
+        "supported_quantization": [4, 8],
+        "recommended_profiles": ["draft", "balanced", "high", "maximum"],
+        "default_profile": "high",
+        "memory_requirement": "~8-12 GB",
+        "is_default": True,
+        "description": "高品質專用模型，細節細膩、光影層次豐富",
+        "available": True,
+    },
+    "flux2-klein-4b": {
+        "id": "flux2-klein-4b",
+        "display_name": "FLUX.2 Klein 4B — Fast",
+        "backend": "mlx_mflux",
+        "supports_t2i": True,
+        "supports_i2i": True,
+        "supports_multi_reference": False,
+        "supported_quantization": [4, 8],
+        "recommended_profiles": ["draft", "balanced", "high", "maximum"],
+        "default_profile": "high",
+        "memory_requirement": "~3-5 GB",
+        "is_default": False,
+        "description": "極速備用模型，4步快速構圖",
+        "available": True,
+    },
+}
+
+
+def get_available_image_models() -> dict[str, Any]:
+    """Retrieve available image models, capabilities, and default selection."""
+    return {
+        "default_model": "krea-2",
+        "models": list(IMAGE_MODELS.values()),
+    }
+
+
+@dataclass
+class ResolvedImageConfig:
+    model_name: str
+    steps: int
+    quantize: int
+    width: int
+    height: int
+    guidance: float
+    scheduler: str | None = None
+    quality_profile: str = "high"
+
+
+def resolve_image_profile(
+    model_name: str = "krea-2",
+    quality_profile: str = "high",
+    width: int = 768,
+    height: int = 768,
+    custom_steps: int | None = None,
+    custom_quantize: int | None = None,
+) -> ResolvedImageConfig:
+    """Resolve model-specific inference parameters for Draft/Balanced/High/Maximum."""
+    model_key = "krea-2" if "krea" in str(model_name).lower() else "flux2-klein-4b"
+    qp = (quality_profile or "high").lower()
+
+    if qp == "custom":
+        w = (width // 16) * 16
+        h = (height // 16) * 16
+        return ResolvedImageConfig(
+            model_name=model_key,
+            steps=custom_steps if custom_steps and custom_steps > 0 else (8 if model_key == "krea-2" else 4),
+            quantize=custom_quantize if custom_quantize in [4, 8] else 4,
+            width=max(256, min(1536, w)),
+            height=max(256, min(1536, h)),
+            guidance=1.0,
+            quality_profile="custom",
+        )
+
+    if model_key == "krea-2":
+        if qp == "draft":
+            return ResolvedImageConfig(
+                model_name=model_key,
+                steps=4,
+                quantize=4,
+                width=512,
+                height=512,
+                guidance=1.0,
+                quality_profile="draft",
+            )
+        elif qp == "balanced":
+            return ResolvedImageConfig(
+                model_name=model_key,
+                steps=6,
+                quantize=4,
+                width=768,
+                height=768,
+                guidance=1.0,
+                quality_profile="balanced",
+            )
+        elif qp == "maximum":
+            # Maximum on Krea 2: 12 steps, 8-bit precision, 1024x1024
+            return ResolvedImageConfig(
+                model_name=model_key,
+                steps=12,
+                quantize=8,
+                width=1024,
+                height=1024,
+                guidance=1.0,
+                quality_profile="maximum",
+            )
+        else:  # "high" (Default)
+            return ResolvedImageConfig(
+                model_name=model_key,
+                steps=8,
+                quantize=4,
+                width=1024,
+                height=1024,
+                guidance=1.0,
+                quality_profile="high",
+            )
+    else:  # FLUX.2 Klein 4B
+        if qp == "draft":
+            return ResolvedImageConfig(
+                model_name=model_key,
+                steps=2,
+                quantize=4,
+                width=512,
+                height=512,
+                guidance=1.0,
+                quality_profile="draft",
+            )
+        elif qp == "balanced":
+            return ResolvedImageConfig(
+                model_name=model_key,
+                steps=4,
+                quantize=4,
+                width=768,
+                height=768,
+                guidance=1.0,
+                quality_profile="balanced",
+            )
+        elif qp == "maximum":
+            return ResolvedImageConfig(
+                model_name=model_key,
+                steps=8,
+                quantize=4,
+                width=1024,
+                height=1024,
+                guidance=1.0,
+                quality_profile="maximum",
+            )
+        else:  # "high" (Default)
+            return ResolvedImageConfig(
+                model_name=model_key,
+                steps=4,
+                quantize=4,
+                width=1024,
+                height=1024,
+                guidance=1.0,
+                quality_profile="high",
+            )
+
+
+def save_image_history_record(res: ImageResult) -> None:
+    """Append image generation result to history JSONL."""
+    try:
+        with open(IMAGE_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(res), ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Warning: Failed to save image history record: {e}", file=sys.stderr)
+
+
 def generate_images(
     prompt: str,
     width: int = 768,
     height: int = 768,
     steps: int = 4,
     seed: int = -1,
-    model_name: str = "flux2-klein-4b",
+    model_name: str = "krea-2",
+    quality_profile: str = "high",
     quantize: int = 4,
     count: int = 1,
     output_dir: str | Path | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> list[ImageResult]:
-    """Generate 1 to 4 images sequentially using MFLUX (FLUX.2-Klein / FLUX.1) on Apple Silicon."""
+    """Generate 1 to 4 images sequentially using Krea 2 Turbo / FLUX.2 Klein on Apple Silicon."""
     global _RESIDENT_FLUX_MODEL, _RESIDENT_MODEL_NAME
 
     if not prompt or not prompt.strip():
@@ -141,11 +316,22 @@ def generate_images(
     # Step 1: Switch engine residency
     model_manager.switch_to_engine("IMAGE")
 
-    # Align dimensions to multiples of 16
-    width = (width // 16) * 16
-    height = (height // 16) * 16
-    width = max(256, min(1536, width))
-    height = max(256, min(1536, height))
+    # Step 2: Resolve quality profile
+    cfg = resolve_image_profile(
+        model_name=model_name,
+        quality_profile=quality_profile,
+        width=width,
+        height=height,
+        custom_steps=steps,
+        custom_quantize=quantize,
+    )
+
+    eff_width = cfg.width
+    eff_height = cfg.height
+    eff_steps = cfg.steps
+    eff_quantize = cfg.quantize
+    eff_model = cfg.model_name
+    eff_profile = cfg.quality_profile
 
     results: list[ImageResult] = []
     count = max(1, min(4, count))
@@ -154,30 +340,39 @@ def generate_images(
     target_dir = Path(output_dir).expanduser().resolve() if output_dir and str(output_dir).strip() else IMAGES_OUTPUT_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # Normalize model_name: if user passed "schnell" without HF token, use open ungated FLUX.2-Klein-4B
-    has_hf_token = bool(os.environ.get("HF_TOKEN") or os.path.exists(os.path.expanduser("~/.cache/huggingface/token")))
-    if model_name in ["schnell", "flux2", "flux2-klein", "flux2-klein-4b"] and not has_hf_token:
-        model_name = "flux2-klein-4b"
-
     if progress_callback:
-        progress_callback(0.05, f"正在載入 {model_name.upper()} 圖像生成模型...")
+        progress_callback(0.05, f"正在載入 {eff_model.upper()} ({eff_profile.upper()} · {eff_quantize}-bit) 模型...")
 
     # Load model if not resident
-    model_key = f"{model_name}_{quantize}bit"
+    model_key = f"{eff_model}_{eff_quantize}bit"
     if _RESIDENT_FLUX_MODEL is None or _RESIDENT_MODEL_NAME != model_key:
         try:
-            if "klein" in model_name or "flux2" in model_name:
+            # Cleanly unload prior model and purge Metal cache
+            if _RESIDENT_FLUX_MODEL is not None:
+                del _RESIDENT_FLUX_MODEL
+                _RESIDENT_FLUX_MODEL = None
+                gc.collect()
+                try:
+                    import mlx.core as mx
+                    mx.metal.clear_cache()
+                except Exception:
+                    pass
+
+            if eff_model == "krea-2":
+                from mflux.models.krea2.variants.txt2img.krea2 import Krea2
+                from mflux.models.common.config.model_config import ModelConfig
+                krea_cfg = ModelConfig.krea2()
+                _RESIDENT_FLUX_MODEL = Krea2(quantize=eff_quantize, model_config=krea_cfg)
+            else:  # flux2-klein-4b
                 from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
                 from mflux.models.common.config.model_config import ModelConfig
-                cfg = ModelConfig.flux2_klein_4b()
-                _RESIDENT_FLUX_MODEL = Flux2Klein(quantize=quantize, model_config=cfg)
-            else:
-                from mflux.models.flux.variants.txt2img.flux import Flux1
-                _RESIDENT_FLUX_MODEL = Flux1.from_name(model_name=model_name, quantize=quantize)
+                flux_cfg = ModelConfig.flux2_klein_4b()
+                _RESIDENT_FLUX_MODEL = Flux2Klein(quantize=eff_quantize, model_config=flux_cfg)
+
             _RESIDENT_MODEL_NAME = model_key
         except Exception as e:
-            print(f"[ImageEngine] Error loading MFLUX model: {e}", file=sys.stderr)
-            raise RuntimeError(f"無法載入 MFLUX 模型 ({model_name}): {e}")
+            print(f"[ImageEngine] Error loading model ({eff_model}): {e}", file=sys.stderr)
+            raise RuntimeError(f"無法載入模型 ({eff_model}): {e}")
 
     for idx in range(count):
         if cancel_check and cancel_check():
@@ -189,20 +384,20 @@ def generate_images(
         if progress_callback:
             progress_callback(
                 0.1 + 0.85 * (idx / count),
-                f"正在生成第 {idx+1}/{count} 張圖片 (Seed: {current_seed})...",
+                f"正在生成第 {idx+1}/{count} 張圖片 ({eff_model.upper()} · {eff_profile} · Seed: {current_seed})...",
             )
 
         timestamp_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = f"{timestamp_str}_img_seed{current_seed}_{width}x{height}.png"
+        filename = f"{timestamp_str}_{eff_model}_seed{current_seed}_{eff_width}x{eff_height}.png"
         out_path = target_dir / filename
 
         try:
             generated_img = _RESIDENT_FLUX_MODEL.generate_image(
                 seed=current_seed,
                 prompt=prompt.strip(),
-                num_inference_steps=steps,
-                height=height,
-                width=width,
+                num_inference_steps=eff_steps,
+                height=eff_height,
+                width=eff_width,
             )
 
             # Save PIL image
@@ -214,8 +409,16 @@ def generate_images(
                 asset_type="IMAGE",
                 source="GENERATED",
                 file_path=out_path,
+                metadata={
+                    "width": eff_width,
+                    "height": eff_height,
+                    "steps": eff_steps,
+                    "seed": current_seed,
+                    "model": eff_model,
+                    "quality_profile": eff_profile,
+                    "quantize": eff_quantize,
+                },
                 prompt=prompt.strip(),
-                metadata={"seed": current_seed, "width": width, "height": height, "steps": steps, "model": model_key},
             )
 
             res = ImageResult(
@@ -226,26 +429,18 @@ def generate_images(
                 output_filename=filename,
                 prompt=prompt.strip(),
                 seed=current_seed,
-                width=width,
-                height=height,
-                steps=steps,
-                model_name=model_key,
+                width=eff_width,
+                height=eff_height,
+                steps=eff_steps,
+                model_name=eff_model,
                 execution_time_sec=round(exec_time, 2),
-                created_at=datetime.now().strftime("%H:%M:%S"),
+                created_at=datetime.now().isoformat(),
             )
-
-            # Append to history JSONL
-            try:
-                with open(IMAGE_HISTORY_FILE, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(asdict(res), ensure_ascii=False) + "\n")
-            except Exception as e:
-                print(f"Warning: Failed to write image history: {e}", file=sys.stderr)
-
             results.append(res)
+            save_image_history_record(res)
 
         except Exception as e:
-            exec_time = time.time() - start_time
-            print(f"[ImageEngine] Error generating image #{idx+1}: {e}", file=sys.stderr)
+            print(f"[ImageEngine] Error generating image: {e}", file=sys.stderr)
             res = ImageResult(
                 id=str(uuid.uuid4())[:8],
                 asset_id="",
@@ -254,17 +449,16 @@ def generate_images(
                 output_filename="",
                 prompt=prompt.strip(),
                 seed=current_seed,
-                width=width,
-                height=height,
-                steps=steps,
-                model_name=model_key,
-                execution_time_sec=round(exec_time, 2),
-                created_at=datetime.now().strftime("%H:%M:%S"),
+                width=eff_width,
+                height=eff_height,
+                steps=eff_steps,
+                model_name=eff_model,
+                execution_time_sec=round(time.time() - start_time, 2),
+                created_at=datetime.now().isoformat(),
                 error_message=str(e),
             )
             results.append(res)
-
-    if progress_callback:
-        progress_callback(1.0, f"圖片生成完成！已儲存 {len([r for r in results if r.success])} 張圖片。")
+            save_image_history_record(res)
+            raise e
 
     return results

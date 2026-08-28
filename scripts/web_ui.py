@@ -134,7 +134,8 @@ class ImageGenerateRequest(BaseModel):
     height: int = 768
     steps: int = 4
     seed: int = -1
-    model_name: str = "flux2-klein-4b"
+    model_name: str = "krea-2"
+    quality_profile: str = "high"
     quantize: int = 4
     count: int = 1
     output_dir: str | None = None
@@ -470,6 +471,12 @@ async def get_job():
         }
 
 
+@app.get("/api/image/models")
+async def get_image_models_endpoint():
+    """Retrieve available image models, capabilities, and default selection."""
+    return image_engine.get_available_image_models()
+
+
 @app.post("/api/image/generate")
 async def generate_image_endpoint(req: ImageGenerateRequest):
     """Generate image locally using MFLUX with dynamic memory swap."""
@@ -502,6 +509,7 @@ async def generate_image_endpoint(req: ImageGenerateRequest):
             steps=req.steps,
             seed=req.seed,
             model_name=req.model_name,
+            quality_profile=req.quality_profile,
             quantize=req.quantize,
             count=req.count,
             output_dir=req.output_dir,
@@ -1233,9 +1241,29 @@ INDEX_HTML = """<!DOCTYPE html>
             <textarea id="prompt" placeholder="輸入描述 (例如: A cinematic shot of a happy golden retriever running in a park, soft sunlight filtering through trees)"></textarea>
           </div>
 
+          <!-- Image Generation Controls (Model & Quality Bar) -->
+          <div class="image-model-ctrl" style="display:flex; gap:0.6rem; align-items:center; background:rgba(11,15,23,0.6); padding:0.5rem 0.75rem; border-radius:8px; border:1px solid var(--card-border); margin-bottom:0.6rem; flex-wrap:wrap;">
+            <div style="display:flex; align-items:center; gap:0.4rem;">
+              <span style="font-size:0.75rem; font-weight:700; color:#818cf8;">🎨 模型:</span>
+              <select id="image-model-select" style="font-size:0.75rem; padding:0.25rem 0.5rem; background:rgba(0,0,0,0.5); border:1px solid var(--card-border); color:var(--text-main); border-radius:6px; font-weight:600;">
+                <option value="krea-2" selected>🌟 Krea 2 Turbo — Quality</option>
+                <option value="flux2-klein-4b">⚡ FLUX.2 Klein 4B — Fast</option>
+              </select>
+            </div>
+            <div style="display:flex; align-items:center; gap:0.4rem; flex:1; min-width:220px;">
+              <span style="font-size:0.75rem; font-weight:700; color:#a5b4fc;">品質:</span>
+              <div class="chips-container" id="img-quality-selector" style="display:flex; gap:0.25rem; flex:1;">
+                <span class="chip" id="qchip-draft" onclick="setImageQuality('draft')">Draft</span>
+                <span class="chip" id="qchip-balanced" onclick="setImageQuality('balanced')">Balanced</span>
+                <span class="chip active" id="qchip-high" onclick="setImageQuality('high')">High</span>
+                <span class="chip" id="qchip-maximum" onclick="setImageQuality('maximum')">Maximum</span>
+              </div>
+            </div>
+          </div>
+
           <!-- Action Buttons Bar -->
           <div class="btn-action-row">
-            <button class="btn-gen-img" onclick="handleGenerateImageClick();" title="使用 MFLUX 快速生成 1~4 張圖片構圖">
+            <button class="btn-gen-img" onclick="handleGenerateImageClick();" title="使用所選模型快速生成圖片">
               <span>🖼️ 生成圖片</span>
             </button>
             <button class="btn-gen-vid" id="btn-gen-video" onclick="handleGenerateVideoClick();" title="立即開始生成影片">
@@ -1647,25 +1675,50 @@ INDEX_HTML = """<!DOCTYPE html>
       input.click();
     }
 
-    // Image Generation API
+    // Image Generation Controls & API
+    let currentImageQuality = 'high';
+
+    function setImageQuality(q) {
+      currentImageQuality = q;
+      document.querySelectorAll('#img-quality-selector .chip').forEach(c => c.classList.remove('active'));
+      const activeChip = document.getElementById('qchip-' + q);
+      if (activeChip) activeChip.classList.add('active');
+    }
+
+    async function loadAvailableImageModels() {
+      try {
+        const res = await fetch('/api/image/models');
+        if (!res.ok) return;
+        const data = await res.json();
+        const select = document.getElementById('image-model-select');
+        if (select && data.models) {
+          select.innerHTML = data.models.map(m => `
+            <option value="${m.id}" ${m.id === data.default_model ? 'selected' : ''}>${m.display_name}</option>
+          `).join('');
+        }
+      } catch (e) {}
+    }
+
     async function handleGenerateImageClick() {
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) {
         showToast('⚠️ 請先輸入提示詞！');
         return;
       }
+      const model_name = document.getElementById('image-model-select')?.value || 'krea-2';
       const output_dir = (document.getElementById('output-dir')?.value || '').trim();
-      showToast('🎨 開始使用 MFLUX 生成圖片...');
+      showToast(`🎨 開始使用 ${model_name.toUpperCase()} (${currentImageQuality.toUpperCase()}) 生成圖片...`);
       try {
         const res = await fetch('/api/image/generate', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             prompt: prompt,
-            width: 768,
-            height: 768,
-            steps: 4,
-            model_name: 'flux2-klein-4b',
+            model_name: model_name,
+            quality_profile: currentImageQuality,
+            width: parseInt(document.getElementById('custom-w')?.value || 768),
+            height: parseInt(document.getElementById('custom-h')?.value || 768),
+            steps: parseInt(document.getElementById('custom-steps')?.value || 4),
             quantize: 4,
             count: 1,
             output_dir: output_dir
@@ -2105,6 +2158,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     // Init
     async function initApp() {
+      await loadAvailableImageModels();
       await syncStatus();
       await syncJobState();
       await fetchQueue();
