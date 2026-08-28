@@ -251,12 +251,28 @@ def generate_images(...):
 
 ---
 
+## 🔄 模型後台即時更新與同步機制 (Model Auto-Updater)
+
+為了實現圖片與影片模型隨時保持最新版本且不中斷前台操作，後端在 `scripts/model_updater.py` 中實現背景自動檢查與同步機制：
+
+1. **非同步守護線程 (`ModelUpdater`)**：
+   * 在獨立 Daemon Thread 中定期（預設每 1 小時）連線 Hugging Face API 檢查註冊表中的模型 Commit SHA。
+   * 支援使用者在前端隨時點擊 `HEADER` 徽章手動觸發即時檢查。
+2. **顯存安全保護**：
+   * 當系統目前有生成任務進行中 (`is_running == True`) 或 Unified Memory 水位偏高時，自動暫緩後台同步，確保生圖與生影效能與顯存安全。
+3. **零停機熱載入**：
+   * 下載新版權重後，下一次推理任務將自動釋放舊快取並無縫切換至新版本模型。
+
+---
+
 ## 📡 後端 REST API 規格清單
 
 | 端點 (Endpoint) | 方法 (Method) | 請求內容 (Request Payload) | 回應內容 (Response) | 說明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `/api/status` | `GET` | 無 | `{ memory: {...}, default_output_dir: "...", ... }` | 查詢系統 RAM、當前常駐引擎與預設路徑 |
 | `/api/job` | `GET` | 無 | `{ is_running: bool, stage: str, progress: float, ... }` | 輪詢當前正在執行的任務進度與結果 |
+| `/api/models/update-status` | `GET` | 無 | `{ is_checking: bool, models: {...}, last_checked_at: str }` | 取得模型後台同步與更新狀態 |
+| `/api/models/check-updates` | `POST` | 無 | `{ is_checking: bool, models: {...} }` | 手動觸發即時檢查模型最新版本 |
 | `/api/image/generate` | `POST` | `{ prompt, width, height, steps, count, output_dir }` | `{ status: "ok", results: [...] }` | 觸發本地圖片生成 |
 | `/api/image/history` | `GET` | 無 | `[ { id, path, prompt, created_at }, ... ]` | 取得最近生成的圖片歷史清單 |
 | `/api/generate` | `POST` | `{ prompt, profile, width, height, duration_sec, steps, mode, start_image, output_dir }` | `{ status: "started" }` | 啟動影片生成工作 |

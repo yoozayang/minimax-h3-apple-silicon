@@ -551,6 +551,27 @@ async def generate_image_endpoint(req: ImageGenerateRequest):
         raise HTTPException(status_code=500, detail=f"圖片生成失敗: {err_msg}")
 
 
+@app.on_event("startup")
+async def on_startup():
+    try:
+        from .model_updater import model_updater
+        model_updater.start_background_loop()
+    except Exception as e:
+        print(f"Warning: Failed to start model updater loop: {e}", file=sys.stderr)
+
+
+@app.get("/api/models/update-status")
+async def get_models_update_status():
+    from .model_updater import model_updater
+    return model_updater.get_status()
+
+
+@app.post("/api/models/check-updates")
+async def check_models_updates_now():
+    from .model_updater import model_updater
+    return model_updater.check_and_sync_all(force_download=False)
+
+
 @app.get("/api/image/history")
 async def get_image_history_endpoint():
     return image_engine.get_image_history(limit=40)
@@ -1193,6 +1214,10 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div class="system-status">
+      <div class="status-pill" id="model-sync-badge" title="點擊即時檢查模型最新版本" style="cursor:pointer;" onclick="triggerModelUpdateCheck()">
+        <span id="model-sync-icon">🟢</span>
+        <span id="model-sync-text" style="font-size:0.75rem;">模型已同步</span>
+      </div>
       <div class="status-pill">
         <span>RAM:</span>
         <span id="mem-used" style="color:#818cf8;">--</span> / <span id="mem-total">-- GB</span>
@@ -1714,6 +1739,24 @@ INDEX_HTML = """<!DOCTYPE html>
           `).join('');
         }
       } catch (e) {}
+    }
+
+    async function triggerModelUpdateCheck() {
+      const icon = document.getElementById('model-sync-icon');
+      const text = document.getElementById('model-sync-text');
+      if (icon) icon.innerText = '⏳';
+      if (text) text.innerText = '檢查中...';
+      showToast('🔍 正在背景檢查模型最新版本...');
+      try {
+        const res = await fetch('/api/models/check-updates', { method: 'POST' });
+        const data = await res.json();
+        if (icon) icon.innerText = '🟢';
+        if (text) text.innerText = '模型最新';
+        showToast('✅ 模型版本已檢查，所有模型均為最新！');
+      } catch (e) {
+        if (icon) icon.innerText = '⚠️';
+        if (text) text.innerText = '檢查失敗';
+      }
     }
 
     let extremeQualityMode = false;

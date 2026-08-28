@@ -53,7 +53,7 @@
 ### 1. 頂部區域 (Top Bar)
 | 區塊代號 | 區塊名稱 | 主要 DOM ID / Class | 功能說明與包含元素 | 溝通範例 |
 | :--- | :--- | :--- | :--- | :--- |
-| **`HEADER`** | 頂部全域狀態列 | `<header>`, `#mem-used`, `#mem-total`, `#system-state-text` | • 品牌 Logo (`色色 Studio`)<br>• Mac Metal 統一記憶體使用量監控 (`RAM: 24.9 GB / 32.0 GB`)<br>• 系統當前狀態指示燈 (Ready / 生成中) | *「請在 HEADER 增加顯示 Swap 記憶體水位」* |
+| **`HEADER`** | 頂部全域狀態列 | `<header>`, `#model-sync-badge`, `#mem-used`, `#mem-total`, `#system-state-text` | • 品牌 Logo (`色色 Studio`)<br>• **模型後台同步狀態徽章** (`#model-sync-badge`)：`🟢 模型已同步` / `⏳ 檢查中...`，支援點擊即時背景檢查遠端模型更新<br>• Mac Metal 統一記憶體使用量監控 (`RAM: 24.9 GB / 32.0 GB`)<br>• 系統當前狀態指示燈 (Ready / 生成中) | *「請在 HEADER 增加顯示 Swap 記憶體水位」* |
 
 ---
 
