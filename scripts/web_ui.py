@@ -877,15 +877,20 @@ INDEX_HTML = """<!DOCTYPE html>
   </header>
 
   <main>
-    <!-- Left: Generation Controls & Prompt Queue -->
+    <!-- Left: Unified Generation Controls & Prompt Queue -->
     <div class="glass-card">
       <div class="card-title">
-        <span>✨ 提示詞與生成設定</span>
+        <span>✨ 提示詞與排程生成 (Prompt & Queue)</span>
+        <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; font-size:0.8rem; font-weight:normal; color:var(--text-muted);">
+          <input type="checkbox" id="auto-queue-chk" onchange="toggleAutoQueue(this.checked)" checked>
+          <span>🔁 自動連續生成</span>
+        </label>
       </div>
 
+      <!-- Single Unified Prompt Input for both Single & Batch -->
       <div class="form-group">
-        <label for="prompt">Prompt (提示詞)</label>
-        <textarea id="prompt" placeholder="A corgi running through a vibrant grassy field, golden hour lighting, cinematic camera movement..."></textarea>
+        <label for="prompt">Prompt (提示詞 / 支援單行或多行批次輸入)</label>
+        <textarea id="prompt" placeholder="可輸入單筆提示詞立即生成，亦可一次貼入多行提示詞（一行一筆）進行批次排程...&#10;例：&#10;A corgi running through a vibrant grassy field, golden hour lighting&#10;Cyberpunk city street at night, neon reflections in puddles&#10;A cute red panda eating bamboo leaves in misty mountain forest" style="min-height:105px;"></textarea>
         <div class="chips-container">
           <span class="chip" onclick="setPrompt(this.innerText)">A golden retriever catching a frisbee on the beach, splashing ocean waves</span>
           <span class="chip" onclick="setPrompt(this.innerText)">Cyberpunk city street at night, neon reflections in puddles, flying cars</span>
@@ -937,33 +942,6 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Prompt Queue Drawer -->
-      <div class="collapsible" id="queue-drawer">
-        <div class="collapsible-header" onclick="toggleDrawer('queue-drawer', 'queue-arrow')">
-          <span style="display:flex; align-items:center; gap:0.5rem;">
-            <span>📋 提示詞排程隊列 (Prompt Queue)</span>
-            <span class="badge-status queued" id="queue-count-badge">0 筆待處理</span>
-          </span>
-          <span id="queue-arrow">▼</span>
-        </div>
-        <div class="collapsible-content">
-          <div class="form-group">
-            <label>批次新增提示詞 (一行一筆，支援一次貼入 5~20 筆)</label>
-            <textarea id="batch-prompts-input" placeholder="Prompt 1: A white cat playing piano in jazz club&#10;Prompt 2: A sports car drifting in mountain pass&#10;Prompt 3: Cyberpunk ramen shop with neon signs&#10;Prompt 4: An astronaut floating in colorful nebula&#10;Prompt 5: Cute corgi surfing on ocean waves" style="min-height:90px;"></textarea>
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-              <button class="btn-secondary" style="padding:0.45rem 0.85rem;" onclick="addBatchToQueue()">➕ 加入排程隊列</button>
-              <label style="display:flex; align-items:center; gap:0.4rem; cursor:pointer; font-size:0.8rem;">
-                <input type="checkbox" id="auto-queue-chk" onchange="toggleAutoQueue(this.checked)" checked>
-                <span>🔁 自動連續生成 (Auto Queue)</span>
-              </label>
-            </div>
-          </div>
-          <div class="queue-list" id="queue-items-container">
-            <p style="color:var(--text-muted); font-size:0.8rem;">目前排程隊列為空。</p>
-          </div>
-        </div>
-      </div>
-
       <!-- Advanced Drawer -->
       <div class="collapsible" id="advanced-drawer">
         <div class="collapsible-header" onclick="toggleDrawer('advanced-drawer', 'adv-arrow')">
@@ -994,13 +972,13 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Action Buttons -->
+      <!-- Unified Action Buttons -->
       <div class="btn-row">
-        <button class="btn-generate" id="btn-gen" onclick="startGenerateStandalone()">
-          <span>🚀 開始生成 (Generate)</span>
+        <button class="btn-generate" id="btn-gen" onclick="handleGenerateClick()">
+          <span>🚀 立即生成 (Generate)</span>
         </button>
-        <button class="btn-secondary" id="btn-add-single-queue" onclick="addSinglePromptToQueue()" title="加入排程稍後生成">
-          <span>➕ 加到排程</span>
+        <button class="btn-secondary" id="btn-add-single-queue" onclick="handleAddToQueueClick()" title="將上方輸入的提示詞（單筆或多筆）加入排程隊列">
+          <span>➕ 批次加入排程</span>
         </button>
         <button class="btn-cancel" id="btn-cancel" onclick="cancelCurrentGeneration()">
           <span>🛑 中止生成 (Cancel)</span>
@@ -1020,6 +998,20 @@ INDEX_HTML = """<!DOCTYPE html>
           <div class="progress-bar-fill" id="progress-bar"></div>
         </div>
       </div>
+
+      <!-- Unified Queue List Container -->
+      <div class="form-group" style="margin-top:0.5rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.25rem;">
+          <span style="font-size:0.85rem; font-weight:700; color:var(--text-muted); display:flex; align-items:center; gap:0.5rem;">
+            <span>📋 排程清單 (Queue)</span>
+            <span class="badge-status queued" id="queue-count-badge">0 筆待處理</span>
+          </span>
+          <button class="btn-tiny" onclick="fetchQueue()" title="重新整理排程">🔄 整理</button>
+        </div>
+        <div class="queue-list" id="queue-items-container">
+          <p style="color:var(--text-muted); font-size:0.8rem; padding:0.5rem 0;">目前排程隊列為空。在上方輸入提示詞後點擊「➕ 批次加入排程」即可新增。</p>
+        </div>
+      </div>
     </div>
 
     <!-- Right: Result Showcase, Player & Post-Processing Subtitle Editor -->
@@ -1030,7 +1022,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
       <div class="player-container" id="player-wrap">
         <div class="empty-state" id="empty-state">
-          點擊「開始生成」或執行排程後，影片將在此播放
+          點擊「立即生成」或從下方歷史紀錄選擇影片進行播放與字幕編輯
         </div>
         <video id="video-player" controls style="display:none;"></video>
       </div>
@@ -1056,8 +1048,8 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Post-Processing Subtitle Editor Drawer -->
-      <div class="collapsible open" id="sub-editor-drawer" style="display:none;">
+      <!-- Post-Processing Subtitle Editor (Always visible by default) -->
+      <div class="collapsible open" id="sub-editor-drawer">
         <div class="collapsible-header" onclick="toggleDrawer('sub-editor-drawer', 'sub-edit-arrow')">
           <span>💬 後期字幕編輯 (Subtitle & Caption Editor)</span>
           <span id="sub-edit-arrow">▲</span>
@@ -1065,7 +1057,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="collapsible-content">
           <div class="form-group">
             <label for="sub-text">字幕文字內容</label>
-            <input type="text" id="sub-text" placeholder="輸入要顯示在此時間區間的字幕...">
+            <input type="text" id="sub-text" placeholder="輸入要在此時間區間顯示的字幕內容...">
           </div>
           <!-- Time Range Selectors -->
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
@@ -1322,7 +1314,7 @@ INDEX_HTML = """<!DOCTYPE html>
       badge.innerText = `${queuedCount} 筆待處理`;
 
       if (!items || items.length === 0) {
-        container.innerHTML = '<p style="color:var(--text-muted); font-size:0.8rem;">目前排程隊列為空。</p>';
+        container.innerHTML = '<p style="color:var(--text-muted); font-size:0.8rem; padding:0.5rem 0;">目前排程隊列為空。在上方輸入提示詞後點擊「➕ 批次加入排程」即可新增。</p>';
         return;
       }
 
@@ -1361,10 +1353,10 @@ INDEX_HTML = """<!DOCTYPE html>
       }).join('');
     }
 
-    async function addBatchToQueue() {
-      const text = document.getElementById('batch-prompts-input').value.trim();
+    async function handleAddToQueueClick() {
+      const text = document.getElementById('prompt').value.trim();
       if (!text) {
-        showToast("請在上方文字框輸入提示詞 (一行一筆)");
+        showToast("請在上方輸入提示詞（可單筆或貼入多行批次）");
         return;
       }
       const profile = document.getElementById('profile').value;
@@ -1382,37 +1374,11 @@ INDEX_HTML = """<!DOCTYPE html>
           body: JSON.stringify({ prompts_text: text, profile, width, height, duration_sec, steps, seed, output_dir })
         });
         if (res.ok) {
-          document.getElementById('batch-prompts-input').value = '';
           const data = await res.json();
           renderQueueList(data.items || []);
-          showToast(`已成功加入 ${data.added_count} 筆提示詞至排程！`);
+          showToast(`已成功加入 ${data.added_count} 筆提示詞至排程隊列！`);
         }
       } catch(e) { showToast("加入排程失敗"); }
-    }
-
-    async function addSinglePromptToQueue() {
-      const prompt = document.getElementById('prompt').value.trim();
-      if (!prompt) { showToast("請輸入提示詞 (Prompt)"); return; }
-      const profile = document.getElementById('profile').value;
-      const width = parseInt(document.getElementById('width').value, 10) || 768;
-      const height = parseInt(document.getElementById('height').value, 10) || 448;
-      const duration_sec = parseFloat(document.getElementById('duration-num').value) || 2.0;
-      const steps = parseInt(document.getElementById('steps').value, 10) || 10;
-      const seed = parseInt(document.getElementById('seed').value, 10);
-      const output_dir = document.getElementById('output-dir').value.trim();
-
-      try {
-        const res = await fetch('/api/queue/batch-add', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ prompts_text: prompt, profile, width, height, duration_sec, steps, seed, output_dir })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          renderQueueList(data.items || []);
-          showToast("已加入排程隊列！");
-        }
-      } catch(e) {}
     }
 
     async function queueAction(itemId, action) {
@@ -1442,8 +1408,12 @@ INDEX_HTML = """<!DOCTYPE html>
 
     /* Subtitle Burn-In */
     async function burnSubtitlesToCurrentVideo() {
-      if (!currentResult || (!currentResult.output_path && !currentResult.output_filename)) {
-        showToast("請先選擇或生成一部影片進行後期字幕編輯");
+      let videoPath = null;
+      if (currentResult && (currentResult.output_path || currentResult.output_filename)) {
+        videoPath = currentResult.output_path || (serverPaths.default + '/' + currentResult.output_filename);
+      }
+      if (!videoPath) {
+        showToast("請先生成影片或從下方歷史紀錄點選一部影片進行字幕編輯");
         return;
       }
       const text = document.getElementById('sub-text').value.trim();
@@ -1451,7 +1421,6 @@ INDEX_HTML = """<!DOCTYPE html>
         showToast("請輸入字幕文字內容");
         return;
       }
-      const videoPath = currentResult.output_path || (serverPaths.default + '/' + currentResult.output_filename);
       const startSec = parseFloat(document.getElementById('sub-start-sec').value) || 0.0;
       const endSec = parseFloat(document.getElementById('sub-end-sec').value) || null;
       const style = document.getElementById('sub-style').value;
@@ -1598,12 +1567,10 @@ INDEX_HTML = """<!DOCTYPE html>
       const player = document.getElementById('video-player');
       const empty = document.getElementById('empty-state');
       const toolbar = document.getElementById('player-toolbar');
-      const subDrawer = document.getElementById('sub-editor-drawer');
 
       empty.style.display = 'none';
       player.style.display = 'block';
       toolbar.style.display = 'flex';
-      subDrawer.style.display = 'block';
 
       player.loop = (playMode === 'loop');
       player.playbackRate = parseFloat(document.getElementById('play-speed').value) || 1.0;
@@ -1661,9 +1628,11 @@ INDEX_HTML = """<!DOCTYPE html>
       document.getElementById('progress-box').style.display = 'none';
     }
 
-    async function startGenerateStandalone() {
-      const prompt = document.getElementById('prompt').value.trim();
-      if (!prompt) { showToast("請輸入提示詞 (Prompt)"); return; }
+    async function handleGenerateClick() {
+      const fullText = document.getElementById('prompt').value.trim();
+      if (!fullText) { showToast("請輸入提示詞 (Prompt)"); return; }
+
+      const lines = fullText.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
       const profile = document.getElementById('profile').value;
       const width = parseInt(document.getElementById('width').value, 10) || 768;
       const height = parseInt(document.getElementById('height').value, 10) || 448;
@@ -1672,11 +1641,25 @@ INDEX_HTML = """<!DOCTYPE html>
       const seed = parseInt(document.getElementById('seed').value, 10);
       const output_dir = document.getElementById('output-dir').value.trim();
 
+      // If user provided multiple lines in the prompt box, immediately run the first one and queue the rest!
+      if (lines.length > 1) {
+        const restLines = lines.slice(1).join('\\n');
+        try {
+          await fetch('/api/queue/batch-add', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ prompts_text: restLines, profile, width, height, duration_sec, steps, seed, output_dir })
+          });
+          fetchQueue();
+        } catch (e) {}
+      }
+
+      const promptToRun = lines[0];
       try {
         const res = await fetch('/api/generate', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ prompt, profile, width, height, duration_sec, steps, seed, output_dir })
+          body: JSON.stringify({ prompt: promptToRun, profile, width, height, duration_sec, steps, seed, output_dir })
         });
         if (!res.ok) {
           const err = await res.json();
@@ -1687,7 +1670,7 @@ INDEX_HTML = """<!DOCTYPE html>
         showRunning({stage: 'Starting generation...', progress: 0.05, elapsed_sec: 0});
         syncJobState();
       } catch (e) {
-        showToast("⚠️ 無法連接到本地伺服器，請確認『色色』已啟動。");
+        showToast("⚠️ 無法連接到本地伺服器，請確認服務已啟動。");
         showIdle();
       }
     }
