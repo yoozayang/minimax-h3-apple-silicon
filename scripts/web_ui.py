@@ -1379,18 +1379,6 @@ INDEX_HTML = """<!DOCTYPE html>
                   <span class="chip" id="chip-movies" onclick="selectPathPreset('movies')">🎬 影片 (Movies)</span>
                 </div>
               </div>
-
-              <!-- Hugging Face Access Token Box -->
-              <div class="form-group" style="margin-top:0.4rem; padding-top:0.6rem; border-top:1px solid rgba(255,255,255,0.06);">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.3rem;">
-                  <label style="margin-bottom:0; color:var(--text-main); font-weight:600;">🔑 Hugging Face Token (Gated 授權模型專用)</label>
-                </div>
-                <div style="display:flex; gap:0.4rem; align-items:center;">
-                  <input type="password" id="hf-token-input" placeholder="hf_..." style="flex:1; font-family:'JetBrains Mono',monospace; font-size:0.75rem; padding:0.45rem 0.65rem; border-radius:6px; background:rgba(0,0,0,0.3); border:1px solid var(--card-border); color:var(--text-main);" />
-                  <button class="btn-tiny" onclick="saveHFTokenClick()" style="font-weight:700;">💾 儲存</button>
-                </div>
-                <span style="font-size:0.68rem; color:var(--text-muted); margin-top:0.2rem;">使用 FHDR-Uncensored-MFLUX 等 Gated 模型時，請填入具備 Read 權限之 HF Token。</span>
-              </div>
             </div>
           </div>
         </div>
@@ -1726,28 +1714,6 @@ INDEX_HTML = """<!DOCTYPE html>
           `).join('');
         }
       } catch (e) {}
-    }
-
-    async function saveHFTokenClick() {
-      const token = (document.getElementById('hf-token-input')?.value || '').trim();
-      if (!token) {
-        showToast('⚠️ 請輸入 Hugging Face Token');
-        return;
-      }
-      showToast('⏳ 正在儲存 Hugging Face Token...');
-      try {
-        const res = await fetch('/api/settings/hf-token', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ token: token })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || '儲存失敗');
-        showToast('✅ Hugging Face Token 已成功儲存！');
-        await loadAvailableImageModels();
-      } catch (e) {
-        showToast(`❌ ${e.message}`);
-      }
     }
 
     let extremeQualityMode = false;

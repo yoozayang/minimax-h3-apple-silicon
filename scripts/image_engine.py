@@ -161,14 +161,31 @@ IMAGE_MODELS: dict[str, dict[str, Any]] = {
 
 
 def check_hf_token_available() -> bool:
-    """Check if Hugging Face token is present in env or local cache."""
+    """Check if Hugging Face token is present in env, .env file, or local cache."""
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        return True
+    # Check .env in project root
+    env_file = Path(__file__).resolve().parent.parent / ".env"
+    if env_file.exists():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("HF_TOKEN=") or line.strip().startswith("HUGGING_FACE_HUB_TOKEN="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        os.environ["HF_TOKEN"] = val
+                        return True
+        except Exception:
+            pass
+    # Check local user cache
     token_path = Path.home() / ".cache" / "huggingface" / "token"
     token_path_alt = Path.home() / ".huggingface" / "token"
-    return bool(
-        os.environ.get("HF_TOKEN")
-        or (token_path.exists() and token_path.read_text().strip())
-        or (token_path_alt.exists() and token_path_alt.read_text().strip())
-    )
+    if token_path.exists() and token_path.read_text().strip():
+        os.environ["HF_TOKEN"] = token_path.read_text().strip()
+        return True
+    if token_path_alt.exists() and token_path_alt.read_text().strip():
+        os.environ["HF_TOKEN"] = token_path_alt.read_text().strip()
+        return True
+    return False
 
 
 def save_hf_token(token: str) -> None:
